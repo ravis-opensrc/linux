@@ -41,6 +41,10 @@
 /* CXL 2.0 - 8.2.8.4 */
 #define CXL_MAILBOX_TIMEOUT_MS (2 * HZ)
 
+/* Default timeout for background operations */
+#define CXL_BG_POLL_CNT                        5
+#define CXL_BG_POLL_INTERVAL_MS                1000
+
 /*
  * CXL 2.0 ECN "Add Mailbox Ready Time" defines a capability field to
  * dictate how long to wait for the mailbox to become ready. The new
@@ -430,6 +434,15 @@ static int cxl_pci_mbox_send(struct cxl_mailbox *cxl_mbox,
 	if (cmd->opcode != CXL_MBOX_OP_SANITIZE) {
 		int i, timeout;
 		u64 bg_status_reg;
+
+                /*
+                 * Add a default timeout of 5 seconds when background operation
+                 * starts but no timeout is specified.
+                 */
+                if (!cmd->poll_interval_ms) {
+                        cmd->poll_interval_ms = CXL_BG_POLL_INTERVAL_MS;
+                        cmd->poll_count = CXL_BG_POLL_CNT;
+                }
 
 		timeout = cmd->poll_interval_ms;
 		for (i = 0; i < cmd->poll_count; i++) {
