@@ -593,6 +593,23 @@ struct cxl_cel_entry {
 	__le16 effect;
 } __packed;
 
+/*
+ * CEL Entry Effects
+ * CXL rev 3.1 Section 8.2.9.5.2.1; Table 8-75
+ */
+#define        CXL_CEL_FLAG_CFG_CHANGE_AFTER_COLD_RESET BIT(0)
+#define        CXL_CEL_FLAG_CFG_CHANGE_IMMEDIATE BIT(1)
+#define        CXL_CEL_FLAG_DATA_CHANGE_IMMEDIATE BIT(2)
+#define        CXL_CEL_FLAG_POLICY_CHANGE_IMMEDIATE BIT(3)
+#define        CXL_CEL_FLAG_LOG_CHANGE_IMMEDIATE BIT(4)
+#define        CXL_CEL_FLAG_SECURITY_CHANGE BIT(5)
+#define        CXL_CEL_FLAG_BACKGROUND_OPERATION BIT(6)
+#define        CXL_CEL_FLAG_SECONDARY_MAILBOX_SUPPORTED BIT(7)
+#define        CXL_CEL_FLAG_REQ_ABORT_BACKGROUND_SUPPORTED BIT(8)
+#define        CXL_CEL_FLAG_CONSIDER_CFG_CHANGE_AFTER_RESET_BITS BIT(9)
+#define        CXL_CEL_FLAG_CFG_CHANGE_AFTER_CONV_RESET BIT(10)
+#define        CXL_CEL_FLAG_CFG_CHANGE_AFTER_CXL_RESET BIT(11)
+
 struct cxl_mbox_get_log {
 	uuid_t uuid;
 	__le32 offset;

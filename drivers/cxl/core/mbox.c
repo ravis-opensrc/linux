@@ -733,12 +733,20 @@ static void cxl_walk_cel(struct cxl_memdev_state *mds, size_t size, u8 *cel)
 
 	for (i = 0; i < cel_entries; i++) {
 		u16 opcode = le16_to_cpu(cel_entry[i].opcode);
+		u16 effect = le16_to_cpu(cel_entry[i].effect);
 		struct cxl_mem_command *cmd = cxl_mem_find_command(opcode);
 		int enabled = 0;
 
 		if (cmd) {
-			set_bit(cmd->info.id, mds->enabled_cmds);
-			enabled++;
+			/*
+			 * For background operation commands, enable only if
+			 * Request abort background operation is supported.
+			 */
+			if (!(effect & CXL_CEL_FLAG_BACKGROUND_OPERATION) ||
+			   (effect & CXL_CEL_FLAG_REQ_ABORT_BACKGROUND_SUPPORTED)) {
+				set_bit(cmd->info.id, mds->enabled_cmds);
+				enabled++;
+			}
 		}
 
 		if (cxl_is_poison_command(opcode)) {
