@@ -27,12 +27,6 @@
 #include "cxl.h"
 #include "hmu.h"
 
-#define CHMU_COMMON_CAP0_REG				0x00
-#define   CHMU_COMMON_CAP0_VER_MSK			GENMASK(3, 0)
-#define   CHMU_COMMON_CAP0_NUMINST_MSK			GENMASK(15, 8)
-#define CHMU_COMMON_CAP1_REG				0x08
-#define   CHMU_COMMON_CAP1_INSTLEN_MSK			GENMASK(15, 0)
-
 /* Register offsets within instance */
 #define CHMU_INST0_CAP0_REG				0x00
 #define   CHMU_INST0_CAP0_MSI_N_MSK			GENMASK(3, 0)
