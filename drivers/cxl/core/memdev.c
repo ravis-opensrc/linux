@@ -776,10 +776,13 @@ static int cxl_mem_activate_fw(struct cxl_memdev_state *mds, int slot)
 	if (slot == 0 || slot > mds->fw.num_slots)
 		return -EINVAL;
 
+	/* Set a 1s poll interval and a total wait time of 10s */
 	mbox_cmd = (struct cxl_mbox_cmd) {
 		.opcode = CXL_MBOX_OP_ACTIVATE_FW,
 		.size_in = sizeof(activate),
 		.payload_in = &activate,
+		.poll_interval_ms = 1000,
+		.poll_count = 10,
 	};
 
 	/* Only offline activation supported for now */
