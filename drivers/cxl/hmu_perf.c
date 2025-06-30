@@ -874,7 +874,7 @@ static __exit void cxl_hmu_exit(void)
 MODULE_AUTHOR("Jonathan Cameron <Jonathan.Cameron@huawei.com>");
 MODULE_DESCRIPTION("CXL Hotness Monitor Driver");
 MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS(CXL);
+MODULE_IMPORT_NS("CXL");
 module_init(cxl_hmu_init);
 module_exit(cxl_hmu_exit);
 MODULE_ALIAS_CXL(CXL_DEVICE_HMU);

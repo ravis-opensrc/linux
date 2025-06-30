@@ -425,7 +425,7 @@ int cxl_map_hmu_regs(struct cxl_register_map *map, struct cxl_hmu_regs *regs)
 
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(cxl_map_hmu_regs, CXL);
+EXPORT_SYMBOL_NS_GPL(cxl_map_hmu_regs, "CXL");
 
 static int cxl_map_regblock(struct cxl_register_map *map)
 {
