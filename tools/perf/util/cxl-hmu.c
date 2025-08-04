@@ -223,7 +223,7 @@ static void cxl_hmu_dump(struct cxl_hmu *hmu __maybe_unused,
 		if (!packet_offset) {
 			hotlist_entries_in_packet = ((uint64_t *)(buf + pos))[0] & 0xFFFF;
 			color_fprintf(stdout, PERF_COLOR_BLUE,
-				      "Header 0: units: %x counter_width %x\n",
+				      "Header 0: units: %zx counter_width %lx\n",
 				      hotlist_entries_in_packet,
 				      (((uint64_t *)(buf + pos))[0] >> 16) & 0xFF);
 		} else if (packet_offset == 1) {

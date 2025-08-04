@@ -136,7 +136,7 @@ struct auxtrace_record *auxtrace_record__init(struct evlist *evlist,
 	if (found_chmu)
 		return chmu_recording_init(err, found_chmu);
 
-	ret = get_cpuid(buffer, sizeof(buffer));
+	ret = get_cpuid(buffer, sizeof(buffer), cpu);
 	if (ret) {
 		*err = ret;
 		return NULL;
