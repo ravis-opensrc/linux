@@ -263,6 +263,18 @@ static unsigned long damon_pa_migrate(struct damon_region *r,
 	phys_addr_t addr, applied;
 	LIST_HEAD(folio_list);
 	struct folio *folio;
+	struct damos_quota_goal *g;
+
+	/* Early exit if node goal already met */
+	list_for_each_entry(g, &s->quota.goals, list) {
+		if (g->metric != DAMOS_QUOTA_NODE_TARGET_MEM_BP)
+			continue;
+		if (g->nid < 0)
+			continue;
+		if (g->current_value <= g->target_value)
+			return 0;
+		break;
+	}
 
 	addr = damon_pa_phys_addr(r->ar.start, addr_unit);
 	while (addr < damon_pa_phys_addr(r->ar.end, addr_unit)) {
