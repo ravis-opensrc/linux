@@ -488,6 +488,8 @@ struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
 	scheme->migrate_dests = (struct damos_migrate_dests){};
 	scheme->target_nid = target_nid;
 
+	memset(&scheme->eligible_cache, 0, sizeof(scheme->eligible_cache));
+
 	return scheme;
 }
 
@@ -2315,6 +2317,12 @@ static void damos_walk_cancel(struct damon_ctx *ctx)
 	mutex_unlock(&ctx->walk_control_lock);
 }
 
+/* Forward declarations for eligible cache management */
+static bool damos_scheme_uses_eligible_metrics(struct damos *s);
+static void damos_update_eligible_cache(struct damon_ctx *c, struct damos *s,
+					int target_nid, int source_nid,
+					unsigned long sz_applied);
+
 static void damos_apply_scheme(struct damon_ctx *c, struct damon_target *t,
 		struct damon_region *r, struct damos *s)
 {
@@ -2378,6 +2386,19 @@ static void damos_apply_scheme(struct damon_ctx *c, struct damon_target *t,
 	}
 	if (s->action != DAMOS_STAT)
 		r->age = 0;
+
+	/*
+	 * Update eligible cache for migration actions. The source_nid is
+	 * derived from the region's physical address before migration.
+	 */
+	if (sz_applied > 0 && damos_scheme_uses_eligible_metrics(s) &&
+	    (s->action == DAMOS_MIGRATE_HOT || s->action == DAMOS_MIGRATE_COLD)) {
+		phys_addr_t paddr = (phys_addr_t)r->ar.start * c->addr_unit;
+		int source_nid = pfn_to_nid(PHYS_PFN(paddr));
+
+		damos_update_eligible_cache(c, s, s->target_nid, source_nid,
+					    sz_applied);
+	}
 
 update_stat:
 	damos_update_stat(s, sz, sz_applied, sz_ops_filter_passed);
@@ -2534,6 +2555,510 @@ static unsigned long damos_get_node_memcg_used_bp(
 		numerator = i.totalram - used_pages;
 	return mult_frac(numerator, 10000, i.totalram);
 }
+
+/*
+ * damos_scheme_uses_eligible_metrics() - Check if scheme uses eligible metrics.
+ * @s: The scheme
+ *
+ * Returns true if any quota goal uses node_eligible_mem_bp or
+ * node_ineligible_mem_bp metrics, which require eligible bytes calculation.
+ */
+static bool damos_scheme_uses_eligible_metrics(struct damos *s)
+{
+	struct damos_quota_goal *goal;
+	struct damos_quota *quota = &s->quota;
+
+	damos_for_each_quota_goal(goal, quota) {
+		if (goal->metric == DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP ||
+		    goal->metric == DAMOS_QUOTA_NODE_INELIGIBLE_MEM_BP)
+			return true;
+	}
+	return false;
+}
+
+/* Forward declarations for functions used in tracing */
+static long damos_get_total_delta(struct damos *s, int nid);
+static unsigned long damos_get_effective_eligible(struct damos *s, int nid);
+
+/*
+ * damos_calc_eligible_bytes_per_node() - Calculate eligible bytes per node.
+ * @c: The DAMON context
+ * @s: The scheme
+ *
+ * Calculates scheme-eligible bytes per NUMA node based on access pattern
+ * matching. A region is eligible if it matches the scheme's access pattern
+ * (size, nr_accesses, age). This does NOT apply address filters - it shows
+ * all memory that matches access patterns regardless of source/target nodes.
+ */
+static void damos_calc_eligible_bytes_per_node(struct damon_ctx *c,
+		struct damos *s)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	phys_addr_t paddr;
+	int nid;
+
+	memset(s->eligible_bytes_per_node, 0,
+			sizeof(s->eligible_bytes_per_node));
+
+	damon_for_each_target(t, c) {
+		damon_for_each_region(r, t) {
+			/* Only check access pattern, NOT address filters */
+			if (!__damos_valid_target(r, s))
+				continue;
+			/*
+			 * Use region start address to determine NUMA node.
+			 * Convert core address to physical address using
+			 * addr_unit, then get node from pfn.
+			 */
+			paddr = (phys_addr_t)r->ar.start * c->addr_unit;
+			nid = pfn_to_nid(PHYS_PFN(paddr));
+			if (nid >= 0 && nid < MAX_NUMNODES)
+				s->eligible_bytes_per_node[nid] +=
+					damon_sz_region(r) * c->addr_unit;
+		}
+	}
+
+	/*
+	 * Update max_eligible tracking when cache is active. This captures
+	 * peak detection values during migration window.
+	 */
+	if (s->eligible_cache.active) {
+		for_each_online_node(nid) {
+			if (s->eligible_bytes_per_node[nid] >
+			    s->eligible_cache.max_eligible[nid])
+				s->eligible_cache.max_eligible[nid] =
+					s->eligible_bytes_per_node[nid];
+		}
+	}
+
+	/* Trace eligible bytes per node */
+	if (trace_damos_eligible_bytes_enabled()) {
+		unsigned int sidx = 0;
+		struct damos *siter;
+		unsigned long total_eligible = 0;
+
+		damon_for_each_scheme(siter, c) {
+			if (siter == s)
+				break;
+			sidx++;
+		}
+		for_each_online_node(nid)
+			total_eligible += s->eligible_bytes_per_node[nid];
+		for_each_online_node(nid) {
+			if (s->eligible_bytes_per_node[nid] || nid < 2)
+				trace_damos_eligible_bytes(sidx, nid,
+						s->eligible_bytes_per_node[nid],
+						total_eligible);
+		}
+	}
+
+	/* Trace effective eligible (cache-adjusted) values */
+	if (trace_damos_effective_eligible_enabled()) {
+		unsigned int sidx = 0;
+		struct damos *siter;
+
+		damon_for_each_scheme(siter, c) {
+			if (siter == s)
+				break;
+			sidx++;
+		}
+		for_each_online_node(nid) {
+			unsigned long detected = s->eligible_bytes_per_node[nid];
+			unsigned long effective = damos_get_effective_eligible(s, nid);
+			long delta = damos_get_total_delta(s, nid);
+
+			/* Trace nodes with activity or first 2 nodes for context */
+			if (detected || effective || delta || nid < 2)
+				trace_damos_effective_eligible(sidx, nid,
+						detected, effective, delta,
+						s->eligible_cache.active);
+		}
+	}
+}
+
+static void damos_refresh_cache_base(struct damos *s)
+{
+	int nid;
+
+	for_each_online_node(nid) {
+		s->eligible_cache.base_eligible[nid] =
+			s->eligible_bytes_per_node[nid];
+		s->eligible_cache.max_eligible[nid] = 0;
+	}
+}
+
+static long damos_get_total_delta(struct damos *s, int nid)
+{
+	long total = 0;
+	int slot;
+
+	for (slot = 0; slot < DAMOS_ELIGIBLE_CACHE_SLOTS; slot++)
+		total += s->eligible_cache.migration_delta[slot][nid];
+
+	return total;
+}
+
+/*
+ * damos_get_effective_eligible() - Get cache-adjusted eligible bytes.
+ * @s: The scheme
+ * @nid: Node ID
+ *
+ * Returns eligible bytes adjusted for detection lag. Uses direction-aware
+ * logic: max() for nodes that received memory (target), min() for nodes
+ * that lost memory (source). This prevents both over-counting and under-
+ * counting while preserving the total across all nodes.
+ */
+static unsigned long damos_get_effective_eligible(struct damos *s, int nid)
+{
+	unsigned long detected, predicted, base;
+	long delta;
+
+	if (nid < 0 || nid >= MAX_NUMNODES)
+		return 0;
+
+	detected = s->eligible_bytes_per_node[nid];
+
+	/* Cache inactive - use detection directly */
+	if (!s->eligible_cache.active)
+		return detected;
+
+	delta = damos_get_total_delta(s, nid);
+
+	/* No migration involving this node */
+	if (delta == 0)
+		return detected;
+
+	base = s->eligible_cache.base_eligible[nid];
+
+	if (delta > 0) {
+		/* Target node: memory added, detection lagging behind reality */
+		predicted = base + delta;
+		return max(detected, predicted);
+	} else {
+		/*
+		 * Source node: memory removed, detection may show stale values.
+		 * Use base_eligible (snapshot at cache activation) for the
+		 * prediction to maintain zero-sum property with target nodes.
+		 *
+		 * Note: We intentionally do NOT use max_seen here because it
+		 * would break zero-sum. max_seen captures the highest detection
+		 * which may include memory that has since been migrated away.
+		 * Using it would prevent source reduction, making cur_value
+		 * unable to reach the goal.
+		 */
+		unsigned long removed = (unsigned long)(-delta);
+		unsigned long max_seen = s->eligible_cache.max_eligible[nid];
+
+		/*
+		 * Use base as the prediction anchor. If base is 0 (cache just
+		 * activated), fall back to detected as a reasonable starting
+		 * point.
+		 */
+		if (base == 0 && detected > 0)
+			base = detected;
+
+		predicted = (removed > base) ? 0 : base - removed;
+
+		/*
+		 * If detected is 0 or significantly below predicted, detection
+		 * is at an oscillation trough due to PA-mode sampling noise.
+		 * Trust the prediction rather than the unreliable low detected
+		 * value. Also use max_seen as a sanity check - if detected is
+		 * below max_seen but above predicted, detection is recovering
+		 * and we should trust it.
+		 */
+		if (detected == 0)
+			return predicted;
+
+		/*
+		 * If detected dropped significantly below what we've seen,
+		 * it's likely oscillation. Use predicted to smooth it out.
+		 */
+		if (max_seen > 0 && detected < max_seen / 4 && predicted > detected)
+			return predicted;
+
+		/*
+		 * If detected has grown significantly beyond base, new hot
+		 * memory has appeared since cache activation. The cache
+		 * snapshot is stale, so trust detection over the stale
+		 * prediction. This prevents grossly underestimating source
+		 * memory when the workload creates new hot regions.
+		 */
+		if (detected > base * 2)
+			return detected;
+
+		return min(detected, predicted);
+	}
+}
+
+/*
+ * damos_get_total_effective_eligible() - Sum effective eligible across nodes.
+ * @s: The scheme
+ *
+ * Used as denominator for goal metrics. Zero-sum property of cache ensures
+ * this equals the true total of hot memory.
+ */
+static unsigned long damos_get_total_effective_eligible(struct damos *s)
+{
+	unsigned long total = 0;
+	int nid;
+
+	for_each_online_node(nid)
+		total += damos_get_effective_eligible(s, nid);
+
+	return total;
+}
+
+static unsigned long damos_get_node_eligible_mem_bp(struct damos *s, int nid)
+{
+	unsigned long total_eligible;
+	unsigned long node_eligible;
+
+	if (nid < 0 || nid >= MAX_NUMNODES)
+		return 0;
+
+	/* Use effective eligible which compensates for detection lag */
+	total_eligible = damos_get_total_effective_eligible(s);
+
+	/*
+	 * If no eligible memory anywhere, return 0. The caller
+	 * (damos_set_quota_goal_current_value) should skip updating
+	 * cur_value when total_eligible=0 to avoid incorrect adjustments.
+	 */
+	if (!total_eligible)
+		return 0;
+
+	node_eligible = damos_get_effective_eligible(s, nid);
+
+	/*
+	 * Return this node's share of total eligible memory in basis points.
+	 * Use mult_frac to avoid integer overflow when node_eligible is large
+	 * (e.g., 200GB * 10000 would overflow unsigned long).
+	 */
+	return mult_frac(node_eligible, 10000, total_eligible);
+}
+
+/*
+ * damos_get_node_ineligible_mem_bp() - Get ineligible memory ratio for a node.
+ * @s: The DAMOS scheme.
+ * @nid: The NUMA node ID.
+ *
+ * Calculate what percentage of total scheme-eligible (hot) memory is NOT on
+ * the specified node. For PUSH schemes migrating from N0 to N1, this metric
+ * with nid=0 represents "what % of hot memory has been pushed away from N0".
+ * Uses cache-adjusted effective eligible bytes to compensate for detection lag.
+ *
+ * Returns: Basis points (0-10000) of total eligible memory NOT on this node.
+ *          Returns 10000 if eligible_bp=0 (all hot memory elsewhere or no data).
+ *          Note: Caller should skip using this when total_eligible=0.
+ */
+static unsigned long damos_get_node_ineligible_mem_bp(struct damos *s, int nid)
+{
+	unsigned long eligible_bp = damos_get_node_eligible_mem_bp(s, nid);
+
+	/*
+	 * When eligible_bp=0, either:
+	 * - total_eligible=0: caller should skip (detection failed)
+	 * - total_eligible>0: all hot memory is on other nodes (100% migrated)
+	 */
+	if (eligible_bp == 0)
+		return 10000;
+
+	return 10000 - eligible_bp;
+}
+
+/*
+ * damos_update_eligible_cache() - Track migration for goal metric adjustment.
+ * @c: The DAMON context (for scheme index lookup in tracing)
+ * @s: The scheme
+ * @target_nid: Destination node
+ * @source_nid: Source node (derived from region)
+ * @sz_applied: Bytes successfully migrated
+ *
+ * Updates the rolling window cache when migration happens. The delta is
+ * zero-sum: bytes subtracted from source equal bytes added to target.
+ */
+static void damos_update_eligible_cache(struct damon_ctx *c, struct damos *s,
+					int target_nid, int source_nid,
+					unsigned long sz_applied)
+{
+	unsigned int slot;
+	bool was_inactive;
+
+	if (sz_applied == 0 || source_nid == target_nid)
+		return;
+
+	was_inactive = !s->eligible_cache.active;
+
+	/* First migration after cache inactive? Take fresh base snapshot */
+	if (was_inactive)
+		damos_refresh_cache_base(s);
+
+	slot = s->eligible_cache.current_slot;
+
+	/* Update migration delta (zero-sum) */
+	if (source_nid >= 0 && source_nid < MAX_NUMNODES)
+		s->eligible_cache.migration_delta[slot][source_nid] -= sz_applied;
+
+	if (target_nid >= 0 && target_nid < MAX_NUMNODES)
+		s->eligible_cache.migration_delta[slot][target_nid] += sz_applied;
+
+	s->eligible_cache.active = true;
+	/* Reset cooldown on every migration to allow detection to stabilize */
+	s->eligible_cache.cooldown = DAMOS_ELIGIBLE_CACHE_COOLDOWN;
+	/* Track timestamp for time-based expiry */
+	s->eligible_cache.last_migration_jiffies = jiffies;
+
+	if (trace_damos_eligible_cache_update_enabled()) {
+		unsigned int sidx = 0;
+		struct damos *siter;
+
+		damon_for_each_scheme(siter, c) {
+			if (siter == s)
+				break;
+			sidx++;
+		}
+		trace_damos_eligible_cache_update(sidx, source_nid, target_nid,
+						  sz_applied, was_inactive);
+	}
+}
+
+/*
+ * damos_advance_cache_window() - Advance rolling window at interval boundary.
+ * @c: The DAMON context (for scheme index lookup in tracing)
+ * @s: The scheme
+ *
+ * Called at end of apply interval. Advances to next slot, clearing old data.
+ * Uses time-based expiry: if no migration for the configured timeout (or
+ * default DAMOS_ELIGIBLE_CACHE_TIMEOUT_MS), clear all slots and deactivate
+ * cache to prevent stale data accumulation.
+ */
+static void damos_advance_cache_window(struct damon_ctx *c, struct damos *s)
+{
+	unsigned int prev_slot, next_slot;
+	unsigned long timeout_ms;
+	int nid, slot;
+	bool has_delta = false;
+	bool timeout_expired;
+
+	if (!s->eligible_cache.active)
+		return;
+
+	prev_slot = s->eligible_cache.current_slot;
+
+	/* Advance to next slot */
+	next_slot = (prev_slot + 1) % DAMOS_ELIGIBLE_CACHE_SLOTS;
+
+	/*
+	 * Time-based expiry: if no migration for timeout period, clear ALL
+	 * slots and deactivate cache. This prevents stale delta data from
+	 * persisting indefinitely when migration has stopped.
+	 *
+	 * Only check timeout when cache has been used (last_migration_jiffies != 0).
+	 * When last_migration_jiffies is 0 (initial state), the timeout check
+	 * would always be true since jiffies is typically much larger, causing
+	 * immediate cache expiry before any migration can happen.
+	 *
+	 * Use configurable timeout if set, otherwise use default.
+	 */
+	timeout_ms = s->eligible_cache.timeout_ms;
+	if (!timeout_ms)
+		timeout_ms = DAMOS_ELIGIBLE_CACHE_TIMEOUT_MS;
+
+	timeout_expired = s->eligible_cache.last_migration_jiffies &&
+			time_after(jiffies,
+			s->eligible_cache.last_migration_jiffies +
+			msecs_to_jiffies(timeout_ms));
+
+	if (timeout_expired) {
+		/* Clear all slots */
+		for (slot = 0; slot < DAMOS_ELIGIBLE_CACHE_SLOTS; slot++)
+			memset(s->eligible_cache.migration_delta[slot], 0,
+			       sizeof(s->eligible_cache.migration_delta[slot]));
+		s->eligible_cache.active = false;
+		s->eligible_cache.cooldown = 0;
+		damos_refresh_cache_base(s);
+
+		if (trace_damos_eligible_cache_advance_enabled()) {
+			unsigned int sidx = 0;
+			struct damos *siter;
+
+			damon_for_each_scheme(siter, c) {
+				if (siter == s)
+					break;
+				sidx++;
+			}
+			trace_damos_eligible_cache_advance(sidx, prev_slot,
+					next_slot, 0, false, true);
+		}
+		return;
+	}
+
+	/*
+	 * Normal operation: only clear slot when cooldown expired.
+	 * During cooldown, preserve deltas for accurate compensation
+	 * while detection stabilizes.
+	 */
+	if (s->eligible_cache.cooldown == 0) {
+		memset(s->eligible_cache.migration_delta[next_slot], 0,
+		       sizeof(s->eligible_cache.migration_delta[next_slot]));
+	}
+
+	s->eligible_cache.current_slot = next_slot;
+
+	/* Check if any delta remains in any slot */
+	for (slot = 0; slot < DAMOS_ELIGIBLE_CACHE_SLOTS && !has_delta; slot++) {
+		for_each_online_node(nid) {
+			if (s->eligible_cache.migration_delta[slot][nid] != 0) {
+				has_delta = true;
+				break;
+			}
+		}
+	}
+
+	/*
+	 * Deactivate only when no recent migrations AND cooldown expired.
+	 * Cooldown keeps cache active after migration stops, giving detection
+	 * time to stabilize at the new physical addresses.
+	 */
+	if (!has_delta) {
+		bool became_inactive = false;
+
+		if (s->eligible_cache.cooldown > 0) {
+			s->eligible_cache.cooldown--;
+		} else {
+			s->eligible_cache.active = false;
+			became_inactive = true;
+			damos_refresh_cache_base(s);
+		}
+
+		if (trace_damos_eligible_cache_advance_enabled()) {
+			unsigned int sidx = 0;
+			struct damos *siter;
+
+			damon_for_each_scheme(siter, c) {
+				if (siter == s)
+					break;
+				sidx++;
+			}
+			trace_damos_eligible_cache_advance(sidx, prev_slot,
+					next_slot, s->eligible_cache.cooldown,
+					has_delta, became_inactive);
+		}
+	} else if (trace_damos_eligible_cache_advance_enabled()) {
+		unsigned int sidx = 0;
+		struct damos *siter;
+
+		damon_for_each_scheme(siter, c) {
+			if (siter == s)
+				break;
+			sidx++;
+		}
+		trace_damos_eligible_cache_advance(sidx, prev_slot, next_slot,
+				s->eligible_cache.cooldown, has_delta, false);
+	}
+}
 #else
 static __kernel_ulong_t damos_get_node_mem_bp(
 		struct damos_quota_goal *goal)
@@ -2546,77 +3071,12 @@ static unsigned long damos_get_node_memcg_used_bp(
 {
 	return 0;
 }
-#endif
 
-#ifdef CONFIG_NUMA
-/*
- * damos_calc_eligible_bytes_per_node() - Calculate eligible bytes per node.
- * @c: The DAMON context
- * @s: The scheme
- *
- * Calculates scheme-eligible bytes per NUMA node based on access pattern
- * matching. A region is eligible if it matches the scheme's access pattern
- * (size, nr_accesses, age).
- */
-static void damos_calc_eligible_bytes_per_node(struct damon_ctx *c,
-		struct damos *s)
+static bool damos_scheme_uses_eligible_metrics(struct damos *s)
 {
-	struct damon_target *t;
-	struct damon_region *r;
-	unsigned long paddr;
-	int nid;
-
-	memset(s->eligible_bytes_per_node, 0,
-			sizeof(s->eligible_bytes_per_node));
-
-	damon_for_each_target(t, c) {
-		damon_for_each_region(r, t) {
-			if (!__damos_valid_target(r, s))
-				continue;
-
-			paddr = r->ar.start;
-			nid = pfn_to_nid(PHYS_PFN(paddr));
-			if (nid >= 0 && nid < MAX_NUMNODES)
-				s->eligible_bytes_per_node[nid] +=
-					damon_sz_region(r);
-		}
-	}
+	return false;
 }
 
-static unsigned long damos_get_node_eligible_mem_bp(struct damos *s, int nid)
-{
-	unsigned long total_eligible = 0;
-	unsigned long node_eligible;
-	int n;
-
-	if (nid < 0 || nid >= MAX_NUMNODES)
-		return 0;
-
-	for_each_online_node(n)
-		total_eligible += s->eligible_bytes_per_node[n];
-
-	if (!total_eligible)
-		return 0;
-
-	node_eligible = s->eligible_bytes_per_node[nid];
-
-	/*
-	 * Return this node's share of total eligible memory in basis points.
-	 * Use mult_frac to avoid integer overflow when node_eligible is large.
-	 */
-	return mult_frac(node_eligible, 10000, total_eligible);
-}
-
-static unsigned long damos_get_node_ineligible_mem_bp(struct damos *s, int nid)
-{
-	unsigned long eligible_bp = damos_get_node_eligible_mem_bp(s, nid);
-
-	if (eligible_bp == 0)
-		return 10000;
-
-	return 10000 - eligible_bp;
-}
-#else
 static void damos_calc_eligible_bytes_per_node(struct damon_ctx *c,
 		struct damos *s)
 {
@@ -2630,6 +3090,16 @@ static unsigned long damos_get_node_eligible_mem_bp(struct damos *s, int nid)
 static unsigned long damos_get_node_ineligible_mem_bp(struct damos *s, int nid)
 {
 	return 0;
+}
+
+static void damos_update_eligible_cache(struct damon_ctx *c, struct damos *s,
+					int target_nid, int source_nid,
+					unsigned long sz_applied)
+{
+}
+
+static void damos_advance_cache_window(struct damon_ctx *c, struct damos *s)
+{
 }
 #endif
 
@@ -2664,6 +3134,7 @@ static void damos_set_quota_goal_current_value(struct damos_quota_goal *goal,
 		now_psi_total = damos_get_some_mem_psi_total();
 		goal->current_value = now_psi_total - goal->last_psi_total;
 		goal->last_psi_total = now_psi_total;
+		pr_info("PSI current value %lu\n", goal->current_value);
 		break;
 	case DAMOS_QUOTA_NODE_MEM_USED_BP:
 	case DAMOS_QUOTA_NODE_MEM_FREE_BP:
@@ -2674,12 +3145,21 @@ static void damos_set_quota_goal_current_value(struct damos_quota_goal *goal,
 		goal->current_value = damos_get_node_memcg_used_bp(goal);
 		break;
 	case DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP:
-		goal->current_value = damos_get_node_eligible_mem_bp(s,
-				goal->nid);
-		break;
 	case DAMOS_QUOTA_NODE_INELIGIBLE_MEM_BP:
-		goal->current_value = damos_get_node_ineligible_mem_bp(s,
-				goal->nid);
+		/*
+		 * Only update cur_value when we have valid detection data.
+		 * When detection fails (total_eligible=0), keep the previous
+		 * cur_value so auto-tuning continues based on last known state
+		 * rather than making incorrect adjustments based on no data.
+		 */
+		if (damos_get_total_effective_eligible(s)) {
+			if (goal->metric == DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP)
+				goal->current_value = damos_get_node_eligible_mem_bp(
+						s, goal->nid);
+			else
+				goal->current_value = damos_get_node_ineligible_mem_bp(
+						s, goal->nid);
+		}
 		break;
 	case DAMOS_QUOTA_ACTIVE_MEM_BP:
 	case DAMOS_QUOTA_INACTIVE_MEM_BP:
@@ -2692,9 +3172,9 @@ static void damos_set_quota_goal_current_value(struct damos_quota_goal *goal,
 }
 
 /* Return the highest score since it makes schemes least aggressive */
-static unsigned long damos_quota_score(struct damos_quota *quota)
+static unsigned long damos_quota_score(struct damos_quota *quota,
+		struct damos *s)
 {
-	struct damos *s = container_of(quota, struct damos, quota);
 	struct damos_quota_goal *goal;
 	unsigned long highest_score = 0;
 
@@ -2708,17 +3188,19 @@ static unsigned long damos_quota_score(struct damos_quota *quota)
 	return highest_score;
 }
 
-static void damos_goal_tune_esz_bp_consist(struct damos_quota *quota)
+static void damos_goal_tune_esz_bp_consist(struct damos_quota *quota,
+		struct damos *s)
 {
-	unsigned long score = damos_quota_score(quota);
+	unsigned long score = damos_quota_score(quota, s);
 
 	quota->esz_bp = damon_feed_loop_next_input(
 			max(quota->esz_bp, 10000UL), score);
 }
 
-static void damos_goal_tune_esz_bp_temporal(struct damos_quota *quota)
+static void damos_goal_tune_esz_bp_temporal(struct damos_quota *quota,
+		struct damos *s)
 {
-	unsigned long score = damos_quota_score(quota);
+	unsigned long score = damos_quota_score(quota, s);
 
 	if (score >= 10000)
 		quota->esz_bp = 0;
@@ -2731,7 +3213,8 @@ static void damos_goal_tune_esz_bp_temporal(struct damos_quota *quota)
 /*
  * Called only if quota->ms, or quota->sz are set, or quota->goals is not empty
  */
-static void damos_set_effective_quota(struct damos_quota *quota)
+static void damos_set_effective_quota(struct damos_quota *quota,
+		struct damos *s)
 {
 	unsigned long throughput;
 	unsigned long esz = ULONG_MAX;
@@ -2743,9 +3226,9 @@ static void damos_set_effective_quota(struct damos_quota *quota)
 
 	if (!list_empty(&quota->goals)) {
 		if (quota->goal_tuner == DAMOS_QUOTA_GOAL_TUNER_CONSIST)
-			damos_goal_tune_esz_bp_consist(quota);
+			damos_goal_tune_esz_bp_consist(quota, s);
 		else if (quota->goal_tuner == DAMOS_QUOTA_GOAL_TUNER_TEMPORAL)
-			damos_goal_tune_esz_bp_temporal(quota);
+			damos_goal_tune_esz_bp_temporal(quota, s);
 		esz = quota->esz_bp / 10000;
 	}
 
@@ -2764,6 +3247,29 @@ static void damos_set_effective_quota(struct damos_quota *quota)
 	quota->esz = esz;
 
 	pr_info("esz %lu\n", esz);
+}
+
+static void damos_trace_quota_goals(struct damon_ctx *c, struct damos *s,
+		struct damos_quota *quota)
+{
+	unsigned int sidx = 0, goal_idx = 0;
+	struct damos_quota_goal *goal;
+	struct damos *siter;
+
+	if (!trace_damos_quota_goal_enabled())
+		return;
+
+	damon_for_each_scheme(siter, c) {
+		if (siter == s)
+			break;
+		sidx++;
+	}
+
+	damos_for_each_quota_goal(goal, quota) {
+		trace_damos_quota_goal(sidx, goal_idx, goal->target_value,
+				       goal->current_value, quota->esz_bp);
+		goal_idx++;
+	}
 }
 
 static void damos_trace_esz(struct damon_ctx *c, struct damos *s,
@@ -2791,13 +3297,15 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 	if (!quota->ms && !quota->sz && list_empty(&quota->goals))
 		return;
 
-	/* Calculate eligible bytes per node for goal metrics */
-	damos_calc_eligible_bytes_per_node(c, s);
+	/* Calculate eligible bytes per node for quota goal metrics */
+	if (damos_scheme_uses_eligible_metrics(s))
+		damos_calc_eligible_bytes_per_node(c, s);
 
 	/* First charge window */
 	if (!quota->total_charged_sz && !quota->charged_from) {
 		quota->charged_from = jiffies;
-		damos_set_effective_quota(quota);
+		damos_set_effective_quota(quota, s);
+		damos_trace_quota_goals(c, s, quota);
 	}
 
 	/* New charge window starts */
@@ -2815,7 +3323,10 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 		quota->charged_sz = 0;
 		if (trace_damos_esz_enabled())
 			cached_esz = quota->esz;
-		damos_set_effective_quota(quota);
+		damos_set_effective_quota(quota, s);
+		damos_trace_quota_goals(c, s, quota);
+		/* Advance cache window at end of apply interval */
+		damos_advance_cache_window(c, s);
 		if (trace_damos_esz_enabled() && quota->esz != cached_esz)
 			damos_trace_esz(c, s, quota);
 	}
