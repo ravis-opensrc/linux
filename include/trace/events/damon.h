@@ -161,6 +161,133 @@ TRACE_EVENT(damon_aggregated,
 			__entry->nr_accesses, __entry->age)
 );
 
+TRACE_EVENT(damos_eligible_raw,
+
+	TP_PROTO(unsigned int context_idx, unsigned int scheme_idx, int nid,
+		unsigned long node_eligible, unsigned long total_eligible),
+
+	TP_ARGS(context_idx, scheme_idx, nid, node_eligible, total_eligible),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, context_idx)
+		__field(unsigned int, scheme_idx)
+		__field(int, nid)
+		__field(unsigned long, node_eligible)
+		__field(unsigned long, total_eligible)
+	),
+
+	TP_fast_assign(
+		__entry->context_idx = context_idx;
+		__entry->scheme_idx = scheme_idx;
+		__entry->nid = nid;
+		__entry->node_eligible = node_eligible;
+		__entry->total_eligible = total_eligible;
+	),
+
+	TP_printk("ctx_idx=%u scheme_idx=%u nid=%d node_eligible=%lu total=%lu",
+			__entry->context_idx, __entry->scheme_idx, __entry->nid,
+			__entry->node_eligible, __entry->total_eligible)
+);
+
+TRACE_EVENT(damos_eligible_effective,
+
+	TP_PROTO(unsigned int context_idx, unsigned int scheme_idx, int nid,
+		unsigned long detected, unsigned long effective,
+		long delta, bool cache_active),
+
+	TP_ARGS(context_idx, scheme_idx, nid, detected, effective, delta,
+		cache_active),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, context_idx)
+		__field(unsigned int, scheme_idx)
+		__field(int, nid)
+		__field(unsigned long, detected)
+		__field(unsigned long, effective)
+		__field(long, delta)
+		__field(bool, cache_active)
+	),
+
+	TP_fast_assign(
+		__entry->context_idx = context_idx;
+		__entry->scheme_idx = scheme_idx;
+		__entry->nid = nid;
+		__entry->detected = detected;
+		__entry->effective = effective;
+		__entry->delta = delta;
+		__entry->cache_active = cache_active;
+	),
+
+	TP_printk("ctx_idx=%u scheme_idx=%u nid=%d detected=%lu effective=%lu delta=%ld active=%d",
+			__entry->context_idx, __entry->scheme_idx, __entry->nid,
+			__entry->detected, __entry->effective,
+			__entry->delta, __entry->cache_active)
+);
+
+TRACE_EVENT(damos_cache_update,
+
+	TP_PROTO(unsigned int context_idx, unsigned int scheme_idx, int nid,
+		unsigned long sz_applied, unsigned int slot,
+		long delta_in_slot),
+
+	TP_ARGS(context_idx, scheme_idx, nid, sz_applied, slot, delta_in_slot),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, context_idx)
+		__field(unsigned int, scheme_idx)
+		__field(int, nid)
+		__field(unsigned long, sz_applied)
+		__field(unsigned int, slot)
+		__field(long, delta_in_slot)
+	),
+
+	TP_fast_assign(
+		__entry->context_idx = context_idx;
+		__entry->scheme_idx = scheme_idx;
+		__entry->nid = nid;
+		__entry->sz_applied = sz_applied;
+		__entry->slot = slot;
+		__entry->delta_in_slot = delta_in_slot;
+	),
+
+	TP_printk("ctx_idx=%u scheme_idx=%u nid=%d sz_applied=%lu slot=%u delta=%ld",
+			__entry->context_idx, __entry->scheme_idx, __entry->nid,
+			__entry->sz_applied, __entry->slot,
+			__entry->delta_in_slot)
+);
+
+TRACE_EVENT(damos_cache_advance,
+
+	TP_PROTO(unsigned int context_idx, unsigned int scheme_idx, int nid,
+		unsigned int current_slot, long total_delta, bool cache_active),
+
+	TP_ARGS(context_idx, scheme_idx, nid, current_slot, total_delta,
+		cache_active),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, context_idx)
+		__field(unsigned int, scheme_idx)
+		__field(int, nid)
+		__field(unsigned int, current_slot)
+		__field(long, total_delta)
+		__field(bool, cache_active)
+	),
+
+	TP_fast_assign(
+		__entry->context_idx = context_idx;
+		__entry->scheme_idx = scheme_idx;
+		__entry->nid = nid;
+		__entry->current_slot = current_slot;
+		__entry->total_delta = total_delta;
+		__entry->cache_active = cache_active;
+	),
+
+	TP_printk("ctx_idx=%u scheme_idx=%u nid=%d slot=%u total_delta=%ld active=%d",
+			__entry->context_idx, __entry->scheme_idx, __entry->nid,
+			__entry->current_slot, __entry->total_delta,
+			__entry->cache_active)
+);
+
 #endif /* _TRACE_DAMON_H */
 
 /* This part must be outside protection */

@@ -2721,99 +2721,110 @@ static unsigned long damos_goal_get_effective_eligible(
 	}
 }
 
+/* Helper to get scheme index for tracing */
+static void damos_get_trace_idx(struct damon_ctx *c, struct damos *s,
+				unsigned int *cidx, unsigned int *sidx)
+{
+	struct damos *siter;
+
+	*cidx = 0;  /* Context index - typically only one context */
+	*sidx = 0;
+	damon_for_each_scheme(siter, c) {
+		if (siter == s)
+			break;
+		(*sidx)++;
+	}
+}
+
 /*
- * damos_update_goals_cache() - Update cache for all goals after migration.
+ * damos_update_goals_cache() - Update cache for scheme's goals after migration.
  * @c:		The DAMON context.
  * @s:		The scheme that performed the migration.
  * @target_nid:	Destination node of migration.
  * @sz_applied:	Bytes successfully migrated.
  *
- * Called after migration happens. Updates the rolling window cache for ALL
- * schemes' goals that use eligible memory metrics. This enables bidirectional
- * tracking where a single migration affects goals across multiple schemes.
+ * Called after migration happens. Updates the rolling window cache for the
+ * scheme's goals that use eligible memory metrics.
  *
- * For a migration from source to target node:
- * - Goals on target_nid see arrivals: positive delta (memory increased)
- * - Goals on source_nid see departures: negative delta (memory decreased)
+ * Metric-specific tracking based on what each metric needs to compensate for:
  *
- * Note: Currently assumes 2-node configuration where source = !target.
+ * - node_eligible_mem_bp: Track arrivals (positive delta) when memory migrates
+ *   TO the goal's nid. Detection lags behind arrivals because newly arrived
+ *   pages haven't been scanned yet.
+ *
+ * - node_ineligible_mem_bp: Track departures (negative delta) when memory
+ *   migrates AWAY from the goal's nid. Detection lags behind departures
+ *   because departed pages are still counted until the next scan.
  */
 static void damos_update_goals_cache(struct damon_ctx *c, struct damos *s,
 				     int target_nid, unsigned long sz_applied)
 {
-	struct damos *scheme;
+	struct damos_quota *quota = &s->quota;
 	struct damos_quota_goal *goal;
-	int source_nid;
 	long delta;
 
 	if (sz_applied == 0 || target_nid < 0)
 		return;
 
-	/*
-	 * Infer source node from target_nid.
-	 * For 2-node tiering: if target is node 1, source is node 0 and vice
-	 * versa. This works for typical DRAM/CXL configurations.
-	 * TODO: For multi-node systems, source_nid should be passed explicitly.
-	 */
-	source_nid = (target_nid == 0) ? 1 : 0;
+	damos_for_each_quota_goal(goal, quota) {
+		unsigned int slot;
+		unsigned int cidx, sidx;
+		bool is_arrival;
 
-	/*
-	 * Update cache for ALL schemes' goals that use eligible metrics.
-	 * A single migration affects multiple goals:
-	 * - Goals on source_nid see a departure (negative delta)
-	 * - Goals on target_nid see an arrival (positive delta)
-	 */
-	damon_for_each_scheme(scheme, c) {
-		struct damos_quota *quota = &scheme->quota;
+		if (!damos_goal_uses_eligible_metrics(goal))
+			continue;
 
-		damos_for_each_quota_goal(goal, quota) {
-			unsigned int slot;
-			unsigned int cidx, sidx;
+		/*
+		 * Metric-specific tracking based on detection lag:
+		 *
+		 * - node_eligible_mem_bp: Track arrivals only (positive
+		 *   delta when target_nid == goal->nid). Detection lags
+		 *   behind memory arriving at a node.
+		 *
+		 * - node_ineligible_mem_bp: Track departures only
+		 *   (negative delta when target_nid != goal->nid).
+		 *   Detection lags behind memory leaving a node.
+		 */
+		is_arrival = (goal->nid == target_nid);
 
-			if (!damos_goal_uses_eligible_metrics(goal))
+		if (goal->metric == DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP) {
+			if (!is_arrival)
 				continue;
-
-			/*
-			 * Determine delta based on goal's nid relative to
-			 * migration direction:
-			 * - goal->nid == target_nid: arrival, positive delta
-			 * - goal->nid == source_nid: departure, negative delta
-			 * - goal->nid is neither: not affected, skip
-			 */
-			if (goal->nid == target_nid)
-				delta = (long)sz_applied;
-			else if (goal->nid == source_nid)
-				delta = -(long)sz_applied;
-			else
+			delta = (long)sz_applied;
+		} else if (goal->metric == DAMOS_QUOTA_NODE_INELIGIBLE_MEM_BP) {
+			if (is_arrival)
 				continue;
+			delta = -(long)sz_applied;
+		} else {
+			continue;
+		}
 
-			slot = goal->current_slot;
-			/* Prevent overflow/underflow */
-			if (delta > 0 &&
-			    delta > LONG_MAX - goal->migration_delta[slot])
-				goal->migration_delta[slot] = LONG_MAX;
-			else if (delta < 0 &&
-				 delta < LONG_MIN - goal->migration_delta[slot])
-				goal->migration_delta[slot] = LONG_MIN;
-			else
-				goal->migration_delta[slot] += delta;
+		slot = goal->current_slot;
+		/* Prevent overflow/underflow */
+		if (delta > 0 &&
+		    delta > LONG_MAX - goal->migration_delta[slot])
+			goal->migration_delta[slot] = LONG_MAX;
+		else if (delta < 0 &&
+			 delta < LONG_MIN - goal->migration_delta[slot])
+			goal->migration_delta[slot] = LONG_MIN;
+		else
+			goal->migration_delta[slot] += delta;
 
-			/*
-			 * Mark cache as needing initialization. base_eligible
-			 * snapshot taken in damos_get_node_eligible_mem_bp()
-			 * when it first reads detected value.
-			 */
-			if (!goal->cache_active) {
-				goal->cache_active = true;
-				goal->base_eligible_set = false;
-			}
+		/*
+		 * Mark cache as needing initialization. base_eligible
+		 * snapshot taken in damos_get_node_eligible_mem_bp()
+		 * when it first reads detected value.
+		 */
+		if (!goal->cache_active) {
+			goal->cache_active = true;
+			goal->base_eligible_set = false;
+		}
 
-			if (trace_damos_cache_update_enabled()) {
-				damos_get_trace_idx(c, scheme, &cidx, &sidx);
-				trace_damos_cache_update(cidx, sidx, goal->nid,
-						sz_applied, slot,
-						goal->migration_delta[slot]);
-			}
+		if (trace_damos_cache_update_enabled()) {
+			damos_get_trace_idx(c, s, &cidx, &sidx);
+			trace_damos_cache_update(cidx, sidx, goal->nid,
+					sz_applied, slot,
+					goal->migration_delta[slot]);
 		}
 	}
 }
@@ -2867,6 +2878,16 @@ static void damos_advance_goals_cache_window(struct damon_ctx *c,
 			goal->base_eligible = 0;
 			goal->base_eligible_set = false;
 		}
+
+		if (trace_damos_cache_advance_enabled()) {
+			unsigned int cidx, sidx;
+
+			damos_get_trace_idx(c, s, &cidx, &sidx);
+			trace_damos_cache_advance(cidx, sidx, goal->nid,
+					goal->current_slot,
+					damos_goal_get_total_delta(goal),
+					goal->cache_active);
+		}
 	}
 }
 
@@ -2905,8 +2926,19 @@ static unsigned long damos_get_node_eligible_mem_bp(struct damon_ctx *c,
 	if (!total_eligible)
 		return 0;
 
+	/* Always trace raw detected values when trace is enabled */
+	if (trace_damos_eligible_raw_enabled()) {
+		unsigned int cidx, sidx;
+
+		damos_get_trace_idx(c, s, &cidx, &sidx);
+		trace_damos_eligible_raw(cidx, sidx, nid,
+				node_eligible, total_eligible);
+	}
+
 	/* Apply cache adjustment if goal provided and uses eligible metrics */
 	if (goal && damos_goal_uses_eligible_metrics(goal) && goal->cache_active) {
+		unsigned int cidx, sidx;
+
 		/*
 		 * Take base_eligible snapshot on first read after cache
 		 * activation. This captures the detected value BEFORE we
@@ -2919,6 +2951,14 @@ static unsigned long damos_get_node_eligible_mem_bp(struct damon_ctx *c,
 
 		effective_node = damos_goal_get_effective_eligible(goal,
 								   node_eligible);
+
+		/* Trace effective values only when cache is active */
+		damos_get_trace_idx(c, s, &cidx, &sidx);
+		if (trace_damos_eligible_effective_enabled())
+			trace_damos_eligible_effective(cidx, sidx, nid,
+					node_eligible, effective_node,
+					damos_goal_get_total_delta(goal),
+					goal->cache_active);
 		/*
 		 * For total, we use detected value since cache maintains
 		 * zero-sum property (what's added to target equals what's
