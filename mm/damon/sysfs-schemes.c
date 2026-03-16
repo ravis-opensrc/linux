@@ -1038,6 +1038,7 @@ struct damos_sysfs_quota_goal {
 	unsigned long current_value;
 	int nid;
 	char *path;
+	unsigned int nr_cache_slots;
 };
 
 static struct damos_sysfs_quota_goal *damos_sysfs_quota_goal_alloc(void)
@@ -1216,6 +1217,32 @@ static ssize_t path_store(struct kobject *kobj,
 	return count;
 }
 
+static ssize_t nr_cache_slots_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct damos_sysfs_quota_goal *goal = container_of(kobj,
+			struct damos_sysfs_quota_goal, kobj);
+
+	return sysfs_emit(buf, "%u\n", goal->nr_cache_slots);
+}
+
+static ssize_t nr_cache_slots_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct damos_sysfs_quota_goal *goal = container_of(kobj, struct
+			damos_sysfs_quota_goal, kobj);
+	unsigned int nr_slots;
+	int err;
+
+	err = kstrtouint(buf, 0, &nr_slots);
+	if (err)
+		return err;
+	if (nr_slots < 1 || nr_slots > DAMOS_GOAL_CACHE_SLOTS_MAX)
+		return -EINVAL;
+	goal->nr_cache_slots = nr_slots;
+	return count;
+}
+
 static void damos_sysfs_quota_goal_release(struct kobject *kobj)
 {
 	struct damos_sysfs_quota_goal *goal = container_of(kobj,
@@ -1240,12 +1267,16 @@ static struct kobj_attribute damos_sysfs_quota_goal_nid_attr =
 static struct kobj_attribute damos_sysfs_quota_goal_path_attr =
 		__ATTR_RW_MODE(path, 0600);
 
+static struct kobj_attribute damos_sysfs_quota_goal_nr_cache_slots_attr =
+		__ATTR_RW_MODE(nr_cache_slots, 0600);
+
 static struct attribute *damos_sysfs_quota_goal_attrs[] = {
 	&damos_sysfs_quota_goal_target_metric_attr.attr,
 	&damos_sysfs_quota_goal_target_value_attr.attr,
 	&damos_sysfs_quota_goal_current_value_attr.attr,
 	&damos_sysfs_quota_goal_nid_attr.attr,
 	&damos_sysfs_quota_goal_path_attr.attr,
+	&damos_sysfs_quota_goal_nr_cache_slots_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(damos_sysfs_quota_goal);
@@ -2728,6 +2759,8 @@ static int damos_sysfs_add_quota_score(
 		case DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP:
 		case DAMOS_QUOTA_NODE_INELIGIBLE_MEM_BP:
 			goal->nid = sysfs_goal->nid;
+			if (sysfs_goal->nr_cache_slots)
+				goal->nr_cache_slots = sysfs_goal->nr_cache_slots;
 			break;
 		case DAMOS_QUOTA_NODE_MEMCG_USED_BP:
 		case DAMOS_QUOTA_NODE_MEMCG_FREE_BP:

@@ -215,6 +215,10 @@ enum damos_quota_goal_metric {
 	NR_DAMOS_QUOTA_GOAL_METRICS,
 };
 
+/* Detection lag cache constants */
+#define DAMOS_GOAL_CACHE_SLOTS_DEFAULT	4
+#define DAMOS_GOAL_CACHE_SLOTS_MAX	16
+
 /**
  * struct damos_quota_goal - DAMOS scheme quota auto-tuning goal.
  * @metric:		Metric to be used for representing the goal.
@@ -223,6 +227,12 @@ enum damos_quota_goal_metric {
  * @last_psi_total:	Last measured total PSI
  * @nid:		Node id.
  * @memcg_id:		Memcg id.
+ * @migration_delta:	Rolling window of migration deltas for this goal's nid.
+ * @nr_cache_slots:	Number of slots to use in rolling window (1-16).
+ * @current_slot:	Current slot in the rolling window.
+ * @base_eligible:	Eligible bytes snapshot when cache activated.
+ * @base_eligible_set:	Whether base_eligible has been captured.
+ * @cache_active:	Whether detection lag cache is active.
  * @list:		List head for siblings.
  *
  * Data structure for getting the current score of the quota tuning goal.  The
@@ -239,6 +249,12 @@ enum damos_quota_goal_metric {
  *
  * If @metric is DAMOS_QUOTA_NODE_MEMCG_{USED,FREE}_BP, @nid and @memcg_id
  * represents the node id and the cgroup to account the used memory for.
+ *
+ * For DAMOS_QUOTA_NODE_{,IN}ELIGIBLE_MEM_BP metrics, a detection lag cache
+ * is used to compensate for DAMON needing time to re-detect memory after
+ * migration. The cache tracks migration deltas using a rolling window and
+ * adjusts the effective eligible bytes calculation. When all slots become
+ * zero, the cache automatically deactivates.
  */
 struct damos_quota_goal {
 	enum damos_quota_goal_metric metric;
@@ -252,6 +268,13 @@ struct damos_quota_goal {
 			u64 memcg_id;
 		};
 	};
+	/* Detection lag cache (for node_eligible metrics only) */
+	long migration_delta[DAMOS_GOAL_CACHE_SLOTS_MAX];
+	unsigned int nr_cache_slots;
+	unsigned int current_slot;
+	unsigned long base_eligible;
+	bool base_eligible_set;
+	bool cache_active;
 	struct list_head list;
 };
 
