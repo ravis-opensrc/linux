@@ -1920,14 +1920,14 @@ static int damon_sysfs_set_probes(struct damon_ctx *ctx,
 		for (j = 0; j < sys_filters->nr; j++) {
 			struct damon_sysfs_filter *sys_filter =
 				sys_filters->filters_arr[j];
-			struct damon_filter *t;
+			struct damon_filter *filter;
 
-			t = damon_new_filter(sys_filter->type,
+			filter = damon_new_filter(sys_filter->type,
 					sys_filter->matching,
 					sys_filter->allow);
-			if (!t)
+			if (!filter)
 				return -ENOMEM;
-			damon_add_filter(c, t);
+			damon_add_filter(c, filter);
 		}
 	}
 	return 0;
