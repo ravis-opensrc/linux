@@ -771,7 +771,7 @@ struct damon_sysfs_filter_type_name {
 static const struct damon_sysfs_filter_type_name
 damon_sysfs_filter_type_names[] = {
 	{
-		.type = DAMON_TEST_TYPE_ANON,
+		.type = DAMON_FILTER_TYPE_ANON,
 		.name = "anon",
 	},
 };

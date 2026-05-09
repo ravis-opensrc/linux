@@ -739,10 +739,10 @@ struct damon_intervals_goal {
 /**
  * enum damon_filter_type - Type of &struct damon_filter
  *
- * @DAMON_TEST_TYPE_ANON:	Anonymous pages.
+ * @DAMON_FILTER_TYPE_ANON:	Anonymous pages.
  */
 enum damon_filter_type {
-	DAMON_TEST_TYPE_ANON,
+	DAMON_FILTER_TYPE_ANON,
 };
 
 /**
