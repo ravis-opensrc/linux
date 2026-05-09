@@ -125,6 +125,7 @@ static bool damon_pa_filter_pass(phys_addr_t pa, struct damon_probe *p)
 	struct damon_filter *f;
 	struct folio *folio;
 	bool pass = true;
+	struct mem_cgroup *memcg;
 
 	folio = damon_get_folio(PHYS_PFN(pa));
 	damon_for_each_filter(f, p) {
@@ -133,6 +134,17 @@ static bool damon_pa_filter_pass(phys_addr_t pa, struct damon_probe *p)
 		if (f->type == DAMON_FILTER_TYPE_ANON) {
 			if (folio)
 				matched = folio_test_anon(folio);
+		} else if (f->type == DAMON_FILTER_TYPE_MEMCG) {
+			if (folio) {
+				rcu_read_lock();
+				memcg = folio_memcg_check(folio);
+				if (!memcg)
+					matched = false;
+				else
+					matched = f->memcg_id ==
+						mem_cgroup_id(memcg);
+				rcu_read_unlock();
+			}
 		}
 		if (matched) {
 			pass = f->allow;
