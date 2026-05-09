@@ -133,9 +133,9 @@ TRACE_EVENT(damon_monitor_intervals_tune,
 TRACE_EVENT(damon_aggregated_v2,
 
 	TP_PROTO(unsigned int target_id, struct damon_region *r,
-		unsigned int nr_regions),
+		unsigned int nr_regions, unsigned int nr_probes),
 
-	TP_ARGS(target_id, r, nr_regions),
+	TP_ARGS(target_id, r, nr_regions, nr_probes),
 
 	TP_STRUCT__entry(
 		__field(unsigned long, target_id)
@@ -144,10 +144,7 @@ TRACE_EVENT(damon_aggregated_v2,
 		__field(unsigned int, nr_regions)
 		__field(unsigned int, nr_accesses)
 		__field(unsigned int, age)
-		__field(unsigned char, probe_hit0)
-		__field(unsigned char, probe_hit1)
-		__field(unsigned char, probe_hit2)
-		__field(unsigned char, probe_hit3)
+		__dynamic_array(unsigned char, probe_hits, nr_probes)
 	),
 
 	TP_fast_assign(
@@ -157,18 +154,16 @@ TRACE_EVENT(damon_aggregated_v2,
 		__entry->nr_regions = nr_regions;
 		__entry->nr_accesses = r->nr_accesses;
 		__entry->age = r->age;
-		__entry->probe_hit0 = r->probe_hits[0];
-		__entry->probe_hit1 = r->probe_hits[1];
-		__entry->probe_hit2 = r->probe_hits[2];
-		__entry->probe_hit3 = r->probe_hits[3];
+		memcpy(__get_dynamic_array(probe_hits), r->probe_hits,
+			sizeof(*r->probe_hits) * nr_probes);
 	),
 
-	TP_printk("target_id=%lu nr_regions=%u %lu-%lu: %u %u %hhu %hhu %hhu %hhu",
+	TP_printk("target_id=%lu nr_regions=%u %lu-%lu: %u %u probe_hits=%s",
 			__entry->target_id, __entry->nr_regions,
 			__entry->start, __entry->end,
 			__entry->nr_accesses, __entry->age,
-			__entry->probe_hit0, __entry->probe_hit1,
-			__entry->probe_hit2, __entry->probe_hit3)
+			__print_hex(__get_dynamic_array(probe_hits),
+				__get_dynamic_array_len(probe_hits)))
 );
 
 TRACE_EVENT(damon_aggregated,
