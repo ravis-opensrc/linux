@@ -131,8 +131,10 @@ static bool damon_pa_filter_pass(phys_addr_t pa, struct damon_probe *p)
 		if (f->type == DAMON_FILTER_TYPE_ANON) {
 			struct folio *folio = damon_get_folio(PHYS_PFN(pa));
 
-			if (folio)
+			if (folio) {
 				matched = folio_test_anon(folio);
+				folio_put(folio);
+			}
 		}
 		if (matched)
 			return f->allow;
