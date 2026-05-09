@@ -123,24 +123,26 @@ static unsigned int damon_pa_check_accesses(struct damon_ctx *ctx)
 static bool damon_pa_filter_pass(phys_addr_t pa, struct damon_probe *p)
 {
 	struct damon_filter *f;
-	bool default_pass = true;
+	struct folio *folio;
+	bool pass = true;
 
+	folio = damon_get_folio(PHYS_PFN(pa));
 	damon_for_each_filter(f, p) {
 		bool matched = false;
 
 		if (f->type == DAMON_FILTER_TYPE_ANON) {
-			struct folio *folio = damon_get_folio(PHYS_PFN(pa));
-
-			if (folio) {
+			if (folio)
 				matched = folio_test_anon(folio);
-				folio_put(folio);
-			}
 		}
-		if (matched)
-			return f->allow;
-		default_pass = !f->allow;
+		if (matched) {
+			pass = f->allow;
+			break;
+		}
+		pass = !f->allow;
 	}
-	return default_pass;
+	if (folio)
+		folio_put(folio);
+	return pass;
 }
 
 static void damon_pa_apply_probes(struct damon_ctx *ctx)
