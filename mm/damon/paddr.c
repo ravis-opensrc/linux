@@ -120,41 +120,53 @@ static unsigned int damon_pa_check_accesses(struct damon_ctx *ctx)
 	return max_nr_accesses;
 }
 
+static bool damon_pa_filter_match(struct damon_filter *filter,
+		struct folio *folio)
+{
+	bool matched = false;
+	struct mem_cgroup *memcg;
+
+	switch (filter->type) {
+	case DAMON_FILTER_TYPE_ANON:
+		if (!folio) {
+			matched = false;
+			break;
+		}
+		matched = folio_test_anon(folio);
+		break;
+	case DAMON_FILTER_TYPE_MEMCG:
+		if (!folio) {
+			matched = false;
+			break;
+		}
+		rcu_read_lock();
+		memcg = folio_memcg_check(folio);
+		if (!memcg)
+			matched = false;
+		else
+			matched = filter->memcg_id == mem_cgroup_id(memcg);
+		rcu_read_unlock();
+		break;
+	default:
+		break;
+	}
+	return matched == filter->matching;
+}
+
 static bool damon_pa_filter_pass(phys_addr_t pa, struct damon_probe *p)
 {
 	struct damon_filter *f;
 	struct folio *folio;
-	bool pass = true;
-	struct mem_cgroup *memcg;
+	bool default_pass = true;
 
 	folio = damon_get_folio(PHYS_PFN(pa));
 	damon_for_each_filter(f, p) {
-		bool matched = false;
-
-		if (f->type == DAMON_FILTER_TYPE_ANON) {
-			if (folio)
-				matched = folio_test_anon(folio);
-		} else if (f->type == DAMON_FILTER_TYPE_MEMCG) {
-			if (folio) {
-				rcu_read_lock();
-				memcg = folio_memcg_check(folio);
-				if (!memcg)
-					matched = false;
-				else
-					matched = f->memcg_id ==
-						mem_cgroup_id(memcg);
-				rcu_read_unlock();
-			}
-		}
-		if (matched) {
-			pass = f->allow;
-			break;
-		}
-		pass = !f->allow;
+		if (damon_pa_filter_match(f, folio))
+			return f->allow;
+		else
+			default_pass = !f->allow;
 	}
-	if (folio)
-		folio_put(folio);
-	return pass;
+	return default_pass;
 }
 
 static void damon_pa_apply_probes(struct damon_ctx *ctx)
