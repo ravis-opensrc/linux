@@ -882,12 +882,14 @@ struct damon_attrs {
  *
  * @page_table:	Page table Accessed bits scanning.
  * @page_fault:	Page faults monitoring.
+ * @hw_hotness:	Hardware sampling (AMD IBS / Intel PEBS) ring-buffer drain.
  *
  * Read &struct damon_sample_control for more details.
  */
 struct damon_primitives_enabled {
 	bool page_table;
 	bool page_fault;
+	bool hw_hotness;
 };
 
 /**
