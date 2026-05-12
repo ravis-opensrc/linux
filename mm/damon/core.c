@@ -1695,7 +1695,8 @@ static int damon_commit_sample_filters(struct damon_sample_control *dst,
 static bool damon_primitives_enabled_invalid(
 		struct damon_primitives_enabled *config)
 {
-	return config->page_table == config->page_fault;
+	return config->page_table == config->page_fault &&
+		!config->hw_hotness;
 }
 
 static int damon_commit_sample_control(
@@ -3736,6 +3737,25 @@ static bool damon_sample_filter_out(struct damon_access_report *report,
 	return !filter->allow;
 }
 
+static struct damon_region *damon_find_region_in_target(
+		struct damon_target *t, unsigned long addr)
+{
+	struct damon_region *r;
+
+	/*
+	 * Regions are sorted by address; scan linearly and exit early as
+	 * soon as addr < r->ar.start.  A binary search on the linked list
+	 * would need O(n) traversal anyway.
+	 */
+	damon_for_each_region(r, t) {
+		if (addr < r->ar.start)
+			return NULL; /* sorted: no match possible */
+		if (addr < r->ar.end)
+			return r;
+	}
+	return NULL;
+}
+
 static void kdamond_apply_access_report(struct damon_access_report *report,
 		struct damon_target *t, struct damon_ctx *ctx)
 {
@@ -3749,14 +3769,9 @@ static void kdamond_apply_access_report(struct damon_access_report *report,
 	else
 		addr = report->paddr;
 
-	/* todo: make search faster, e.g., binary search? */
-	damon_for_each_region(r, t) {
-		if (addr < r->ar.start)
-			continue;
-		if (r->ar.end < addr + report->size)
-			continue;
-		if (!r->access_reported)
-			damon_update_region_access_rate(r, true, &ctx->attrs);
+	r = damon_find_region_in_target(t, addr);
+	if (r && !r->access_reported) {
+		damon_update_region_access_rate(r, true, &ctx->attrs);
 		r->access_reported = true;
 	}
 }
@@ -3863,7 +3878,8 @@ static int kdamond_fn(void *data)
 		ctx->passed_sample_intervals++;
 
 		/* todo: make these non-exclusive */
-		if (ctx->sample_control.primitives_enabled.page_fault)
+		if (ctx->sample_control.primitives_enabled.page_fault ||
+		    ctx->sample_control.primitives_enabled.hw_hotness)
 			max_nr_accesses = kdamond_check_reported_accesses(ctx);
 		else if (ctx->ops.check_accesses)
 			max_nr_accesses = ctx->ops.check_accesses(ctx);
