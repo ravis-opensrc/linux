@@ -669,12 +669,14 @@ struct damos {
  * @DAMON_OPS_FVADDR:	Monitoring operations for only fixed ranges of virtual
  *			address spaces
  * @DAMON_OPS_PADDR:	Monitoring operations for the physical address space
+ * @DAMON_OPS_PADDR_IBS:	AMD IBS-based PA-mode monitoring
  * @NR_DAMON_OPS:	Number of monitoring operations implementations
  */
 enum damon_ops_id {
 	DAMON_OPS_VADDR,
 	DAMON_OPS_FVADDR,
 	DAMON_OPS_PADDR,
+	DAMON_OPS_PADDR_IBS,
 	NR_DAMON_OPS,
 };
 
@@ -1261,5 +1263,12 @@ static inline void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 }
 
 #endif	/* CONFIG_DAMON */
+
+#if IS_ENABLED(CONFIG_DAMON_IBS)
+int damon_ibs_start(void);
+void damon_ibs_stop(void);
+void damon_ibs_set_sample_rate(unsigned int max_cnt);
+void damon_ibs_get_stats(unsigned long *total, unsigned long *filtered);
+#endif
 
 #endif	/* _DAMON_H */
