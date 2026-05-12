@@ -27,6 +27,15 @@
 #define DAMON_REPORT_RING_SIZE	4096
 #define DAMON_REPORT_RING_MASK	(DAMON_REPORT_RING_SIZE - 1)
 
+/* Per-target region lookup for drain loop */
+struct damon_target_lookup {
+	struct damon_region **regions;
+	unsigned int nr_regions;
+};
+
+unsigned long damon_samples_stale;
+EXPORT_SYMBOL_GPL(damon_samples_stale);
+
 struct damon_report_ring {
 	unsigned int head;	/* written by producer (NMI) */
 	unsigned int tail;	/* written by consumer (kdamond) */
@@ -3737,30 +3746,14 @@ static bool damon_sample_filter_out(struct damon_access_report *report,
 	return !filter->allow;
 }
 
-static struct damon_region *damon_find_region_in_target(
-		struct damon_target *t, unsigned long addr)
-{
-	struct damon_region *r;
-
-	/*
-	 * Regions are sorted by address; scan linearly and exit early as
-	 * soon as addr < r->ar.start.  A binary search on the linked list
-	 * would need O(n) traversal anyway.
-	 */
-	damon_for_each_region(r, t) {
-		if (addr < r->ar.start)
-			return NULL; /* sorted: no match possible */
-		if (addr < r->ar.end)
-			return r;
-	}
-	return NULL;
-}
 
 static void kdamond_apply_access_report(struct damon_access_report *report,
-		struct damon_target *t, struct damon_ctx *ctx)
+		struct damon_region **regions, unsigned int nr_regions,
+		struct damon_ctx *ctx)
 {
 	struct damon_region *r;
 	unsigned long addr;
+	int left, right, mid;
 
 	if (damon_sample_filter_out(report, &ctx->sample_control))
 		return;
@@ -3769,8 +3762,27 @@ static void kdamond_apply_access_report(struct damon_access_report *report,
 	else
 		addr = report->paddr;
 
-	r = damon_find_region_in_target(t, addr);
-	if (r && !r->access_reported) {
+	/* Binary search in the snapshot regions array */
+	left = 0;
+	right = nr_regions - 1;
+	r = NULL;
+	while (left <= right) {
+		mid = (left + right) / 2;
+		if (addr < regions[mid]->ar.start)
+			right = mid - 1;
+		else if (addr >= regions[mid]->ar.end)
+			left = mid + 1;
+		else {
+			r = regions[mid];
+			break;
+		}
+	}
+
+	if (!r) {
+		damon_samples_stale++;
+		return;
+	}
+	if (!r->access_reported) {
 		damon_update_region_access_rate(r, true, &ctx->attrs);
 		r->access_reported = true;
 	}
@@ -3795,10 +3807,61 @@ static unsigned int kdamond_apply_zero_access_report(struct damon_ctx *ctx)
 	return max_nr_accesses;
 }
 
+static struct damon_target_lookup *damon_build_target_lookup(
+		struct damon_ctx *ctx, unsigned int *nr_targets_out)
+{
+	struct damon_target *t;
+	struct damon_target_lookup *tbl;
+	unsigned int nr_targets = 0, ti = 0;
+
+	damon_for_each_target(t, ctx)
+		nr_targets++;
+
+	tbl = kmalloc_array(nr_targets, sizeof(*tbl), GFP_KERNEL);
+	if (!tbl)
+		return NULL;
+
+	damon_for_each_target(t, ctx) {
+		struct damon_region *r;
+		unsigned int ri = 0;
+
+		tbl[ti].nr_regions = damon_nr_regions(t);
+		tbl[ti].regions = kmalloc_array(tbl[ti].nr_regions,
+				sizeof(*tbl[ti].regions), GFP_KERNEL);
+		if (!tbl[ti].regions) {
+			while (ti--)
+				kfree(tbl[ti].regions);
+			kfree(tbl);
+			return NULL;
+		}
+		damon_for_each_region(r, t)
+			tbl[ti].regions[ri++] = r;
+		ti++;
+	}
+	*nr_targets_out = nr_targets;
+	return tbl;
+}
+
+static void damon_free_target_lookup(struct damon_target_lookup *tbl,
+		unsigned int nr_targets)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_targets; i++)
+		kfree(tbl[i].regions);
+	kfree(tbl);
+}
+
 static unsigned int kdamond_check_reported_accesses(struct damon_ctx *ctx)
 {
 	int cpu;
-	struct damon_target *t;
+	struct damon_target_lookup *tbl;
+	unsigned int nr_targets = 0;
+	unsigned int i;
+
+	tbl = damon_build_target_lookup(ctx, &nr_targets);
+	if (!tbl)
+		return kdamond_apply_zero_access_report(ctx);
 
 	for_each_online_cpu(cpu) {
 		struct damon_report_ring *ring =
@@ -3816,14 +3879,16 @@ static unsigned int kdamond_check_reported_accesses(struct damon_ctx *ctx)
 			if (!time_before(report->report_jiffies,
 					jiffies - usecs_to_jiffies(
 						ctx->attrs.sample_interval))) {
-				damon_for_each_target(t, ctx)
-					kdamond_apply_access_report(
-							report, t, ctx);
+				for (i = 0; i < nr_targets; i++)
+					kdamond_apply_access_report(report,
+							tbl[i].regions,
+							tbl[i].nr_regions, ctx);
 			}
 			tail = (tail + 1) & DAMON_REPORT_RING_MASK;
 		}
 		WRITE_ONCE(ring->tail, tail);
 	}
+	damon_free_target_lookup(tbl, nr_targets);
 	/* For nr_accesses_bp, absence of access should also be reported. */
 	return kdamond_apply_zero_access_report(ctx);
 }
