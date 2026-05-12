@@ -93,6 +93,25 @@ int damon_register_ops(struct damon_operations *ops)
 	mutex_unlock(&damon_ops_lock);
 	return err;
 }
+EXPORT_SYMBOL_GPL(damon_register_ops);
+
+/**
+ * damon_unregister_ops() - Unregister a monitoring operations set.
+ * @id:	ID of the operations set to unregister.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int damon_unregister_ops(enum damon_ops_id id)
+{
+	if (id >= NR_DAMON_OPS)
+		return -EINVAL;
+
+	mutex_lock(&damon_ops_lock);
+	memset(&damon_registered_ops[id], 0, sizeof(damon_registered_ops[id]));
+	mutex_unlock(&damon_ops_lock);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(damon_unregister_ops);
 
 /**
  * damon_select_ops() - Select a monitoring operations to use with the context.
