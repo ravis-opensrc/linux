@@ -24,7 +24,17 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/damon.h>
 
-#define DAMON_ACCESS_REPORTS_CAP 1000
+#define DAMON_REPORT_RING_SIZE	4096
+#define DAMON_REPORT_RING_MASK	(DAMON_REPORT_RING_SIZE - 1)
+
+struct damon_report_ring {
+	unsigned int head;	/* written by producer (NMI) */
+	unsigned int tail;	/* written by consumer (kdamond) */
+	struct damon_access_report entries[DAMON_REPORT_RING_SIZE];
+};
+
+static DEFINE_PER_CPU(struct damon_report_ring, damon_report_rings);
+static DEFINE_PER_CPU(unsigned long, damon_report_overflow);
 
 static DEFINE_MUTEX(damon_lock);
 static int nr_running_ctxs;
@@ -35,10 +45,6 @@ static struct damon_operations damon_registered_ops[NR_DAMON_OPS];
 
 static struct kmem_cache *damon_region_cache __ro_after_init;
 
-static DEFINE_MUTEX(damon_access_reports_lock);
-static struct damon_access_report damon_access_reports[
-	DAMON_ACCESS_REPORTS_CAP];
-static int damon_access_reports_len;
 
 /* Should be called under damon_ops_lock with id smaller than NR_DAMON_OPS */
 static bool __damon_is_registered_ops(enum damon_ops_id id)
@@ -2110,19 +2116,21 @@ int damos_walk(struct damon_ctx *ctx, struct damos_walk_control *control)
  */
 void damon_report_access(struct damon_access_report *report)
 {
-	struct damon_access_report *dst;
+	struct damon_report_ring *ring = this_cpu_ptr(&damon_report_rings);
+	unsigned int head = ring->head;
+	unsigned int next = (head + 1) & DAMON_REPORT_RING_MASK;
 
-	/* silently fail for races */
-	if (!mutex_trylock(&damon_access_reports_lock))
+	if (next == READ_ONCE(ring->tail)) {
+		this_cpu_inc(damon_report_overflow);
 		return;
-	dst = &damon_access_reports[damon_access_reports_len++];
-	/* just drop all existing reports in favor of simplicity. */
-	if (damon_access_reports_len == DAMON_ACCESS_REPORTS_CAP)
-		damon_access_reports_len = 0;
-	*dst = *report;
-	dst->report_jiffies = jiffies;
-	mutex_unlock(&damon_access_reports_lock);
+	}
+
+	ring->entries[head] = *report;
+	ring->entries[head].report_jiffies = jiffies;
+	smp_wmb(); /* ensure entry visible before head advance */
+	WRITE_ONCE(ring->head, next);
 }
+EXPORT_SYMBOL_GPL(damon_report_access);
 
 #ifdef CONFIG_MMU
 void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
@@ -3774,26 +3782,33 @@ static unsigned int kdamond_apply_zero_access_report(struct damon_ctx *ctx)
 
 static unsigned int kdamond_check_reported_accesses(struct damon_ctx *ctx)
 {
-	int i;
-	struct damon_access_report *report;
+	int cpu;
 	struct damon_target *t;
 
-	/* currently damon_access_report supports only physical address */
-	if (damon_target_has_pid(ctx))
-		return 0;
+	for_each_online_cpu(cpu) {
+		struct damon_report_ring *ring =
+			per_cpu_ptr(&damon_report_rings, cpu);
+		unsigned int head, tail;
 
-	mutex_lock(&damon_access_reports_lock);
-	for (i = 0; i < damon_access_reports_len; i++) {
-		report = &damon_access_reports[i];
-		if (time_before(report->report_jiffies,
-					jiffies -
-					usecs_to_jiffies(
-						ctx->attrs.sample_interval)))
-			continue;
-		damon_for_each_target(t, ctx)
-			kdamond_apply_access_report(report, t, ctx);
+		head = READ_ONCE(ring->head);
+		smp_rmb(); /* pair with smp_wmb in producer */
+		tail = ring->tail;
+
+		while (tail != head) {
+			struct damon_access_report *report =
+				&ring->entries[tail];
+
+			if (!time_before(report->report_jiffies,
+					jiffies - usecs_to_jiffies(
+						ctx->attrs.sample_interval))) {
+				damon_for_each_target(t, ctx)
+					kdamond_apply_access_report(
+							report, t, ctx);
+			}
+			tail = (tail + 1) & DAMON_REPORT_RING_MASK;
+		}
+		WRITE_ONCE(ring->tail, tail);
 	}
-	mutex_unlock(&damon_access_reports_lock);
 	/* For nr_accesses_bp, absence of access should also be reported. */
 	return kdamond_apply_zero_access_report(ctx);
 }
