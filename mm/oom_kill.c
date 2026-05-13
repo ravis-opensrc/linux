@@ -676,6 +676,39 @@ static void wake_oom_reaper(struct timer_list *timer)
 }
 
 /*
+ * kill_all_shared_mm - Deliver SIGKILL to all processes sharing the given address space.
+ * @victim: the targeted OOM process group leader
+ * @mm:     the virtual memory space being reaped
+ *
+ * Traverse all threads globally and signal any user processes sharing the
+ * identical mm footprints, ensuring no concurrent users pin the memory. Skips
+ * the system global init and kernel worker threads.
+ */
+static int kill_all_shared_mm(struct task_struct *victim, struct mm_struct *mm)
+{
+	struct task_struct *p;
+	bool failed = false;
+
+	rcu_read_lock();
+	for_each_process(p) {
+		if (!process_shares_mm(p, mm))
+			continue;
+		if (is_global_init(p)) {
+			failed = true;
+			continue;
+		}
+		if (unlikely(p->flags & PF_KTHREAD))
+			continue;
+
+		if (do_pidfd_send_signal_pidns(task_pid(p), SIGKILL, PIDTYPE_TGID, NULL, 0))
+			failed = true;
+	}
+	rcu_read_unlock();
+
+	return failed ? -EBUSY : 0;
+}
+
+/*
  * Give the OOM victim time to exit naturally before invoking the oom_reaping.
  * The timers timeout is arbitrary... the longer it is, the longer the worst
  * case scenario for the OOM can take. If it is too small, the oom_reaper can
@@ -908,39 +941,6 @@ static bool task_will_free_mem(struct task_struct *task)
 	rcu_read_unlock();
 
 	return ret;
-}
-
-/*
- * kill_all_shared_mm - Deliver SIGKILL to all processes sharing the given address space.
- * @victim: the targeted OOM process group leader
- * @mm:     the virtual memory space being reaped
- *
- * Traverse all threads globally and signal any user processes sharing the identical
- * mm footprints, ensuring no concurrent users pin the memory. Skips the system
- * global init and kernel worker threads.
- */
-static int kill_all_shared_mm(struct task_struct *victim, struct mm_struct *mm)
-{
-	struct task_struct *p;
-	bool failed = false;
-
-	rcu_read_lock();
-	for_each_process(p) {
-		if (!process_shares_mm(p, mm))
-			continue;
-		if (is_global_init(p)) {
-			failed = true;
-			continue;
-		}
-		if (unlikely(p->flags & PF_KTHREAD))
-			continue;
-
-		if (do_pidfd_send_signal_pidns(task_pid(p), SIGKILL, PIDTYPE_TGID, NULL, 0))
-			failed = true;
-	}
-	rcu_read_unlock();
-
-	return failed ? -EBUSY : 0;
 }
 
 static void __oom_kill_process(struct task_struct *victim, const char *message)
