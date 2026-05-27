@@ -74,6 +74,49 @@ TRACE_EVENT(damos_esz,
 			__entry->esz)
 );
 
+TRACE_EVENT(damon_perf_ring_overflow,
+
+	TP_PROTO(int cpu),
+
+	TP_ARGS(cpu),
+
+	TP_STRUCT__entry(
+		__field(int, cpu)
+	),
+
+	TP_fast_assign(
+		__entry->cpu = cpu;
+	),
+
+	TP_printk("cpu=%d", __entry->cpu)
+);
+
+/* Per-CPU perf_event_create_kernel_counter failure -- coverage gap. */
+TRACE_EVENT(damon_perf_cpu_init_failed,
+
+	TP_PROTO(int cpu, u32 type, u64 config, long err),
+
+	TP_ARGS(cpu, type, config, err),
+
+	TP_STRUCT__entry(
+		__field(int, cpu)
+		__field(u32, type)
+		__field(u64, config)
+		__field(long, err)
+	),
+
+	TP_fast_assign(
+		__entry->cpu = cpu;
+		__entry->type = type;
+		__entry->config = config;
+		__entry->err = err;
+	),
+
+	TP_printk("cpu=%d type=%u config=%llu err=%ld",
+			__entry->cpu, __entry->type,
+			__entry->config, __entry->err)
+);
+
 TRACE_EVENT_CONDITION(damos_before_apply,
 
 	TP_PROTO(unsigned int context_idx, unsigned int scheme_idx,
