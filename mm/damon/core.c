@@ -2299,7 +2299,7 @@ void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 		.vaddr = vmf->address,
 		.size = 1,	/* todo: set appripriately */
 		.cpu = smp_processor_id(),
-		.tid = current->pid,
+		.tid = task_pid_nr(current),
 		.tgid = task_tgid_nr(current),
 		.is_write = vmf->flags & FAULT_FLAG_WRITE,
 	};
