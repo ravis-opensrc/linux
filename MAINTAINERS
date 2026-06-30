@@ -17671,9 +17671,11 @@ L:	linux-mm@kvack.org
 S:	Maintained
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/mm/core.git for-next
 F:	include/linux/migrate.h
+F:	include/linux/migrate_copy_offload.h
 F:	include/linux/migrate_mode.h
 F:	include/trace/events/migrate.h
 F:	mm/migrate.c
+F:	mm/migrate_copy_offload.c
 F:	mm/migrate_device.c
 
 MEMORY MANAGEMENT - MISC

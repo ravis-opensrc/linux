@@ -43,6 +43,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
 #include <linux/pagewalk.h>
+#include <linux/migrate_copy_offload.h>
 
 #include <asm/tlbflush.h>
 
@@ -51,12 +52,6 @@
 #include "internal.h"
 #include "page_alloc.h"
 #include "swap.h"
-
-/* For now, never offload. Wired up in later patch. */
-static bool migrate_should_offload(int reason)
-{
-	return false;
-}
 
 static const struct movable_operations *offline_movable_ops;
 static const struct movable_operations *zsmalloc_movable_ops;
@@ -2084,7 +2079,7 @@ move:
 
 	/* Batch-copy eligible folios before the move phase */
 	if (!list_empty(&unmap_batch))
-		migrate_folios_mc_copy(&dst_batch, &unmap_batch, nr_batch);
+		migrate_offload_batch_copy(&dst_batch, &unmap_batch, nr_batch);
 
 	retry = 1;
 	for (pass = 0; pass < nr_pass && retry; pass++) {
