@@ -72,6 +72,9 @@ void folio_migrate_flags(struct folio *newfolio, struct folio *folio);
 int folio_migrate_mapping(struct address_space *mapping,
 		struct folio *newfolio, struct folio *folio, int extra_count);
 int set_movable_ops(const struct movable_operations *ops, enum pagetype type);
+int migrate_folios_mc_copy(struct list_head *dst_list,
+		struct list_head *src_list,
+		unsigned int __always_unused folios_cnt);
 
 /*
  * To record some information during migration, we use the migrate_info

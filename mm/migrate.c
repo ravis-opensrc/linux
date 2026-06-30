@@ -52,6 +52,12 @@
 #include "page_alloc.h"
 #include "swap.h"
 
+/* For now, never offload. Wired up in later patch. */
+static bool migrate_should_offload(int reason)
+{
+	return false;
+}
+
 static const struct movable_operations *offline_movable_ops;
 static const struct movable_operations *zsmalloc_movable_ops;
 
@@ -1741,6 +1747,60 @@ static int migrate_hugetlbs(struct list_head *from, new_folio_t get_new_folio,
 	return nr_failed;
 }
 
+static bool folio_can_batch_copy(struct folio *folio)
+{
+	/* movable_ops pages have a separate migration path */
+	if (unlikely(page_has_movable_ops(&folio->page)))
+		return false;
+
+	/*
+	 * Only batch when refcount matches the expected refcount.
+	 * Otherwise a GUP holder could modify src between the
+	 * batch copy and the move-phase refcount check, leaving the
+	 * dst folio with a stale copy.
+	 */
+	return folio_ref_count(folio) == folio_expected_ref_count(folio) + 1;
+}
+
+/**
+ * migrate_folios_mc_copy - Copy the contents of a list of folios.
+ * @dst_list: destination folio list.
+ * @src_list: source folio list.
+ * @folios_cnt: unused here, present for callback signature compatibility.
+ *
+ * Walk src and dst folio lists in lockstep, copy each folio via
+ * folio_mc_copy(), and mark the dst with FOLIO_CONTENT_COPIED so the
+ * move phase in __migrate_folio() skips the per-folio copy. The caller
+ * must ensure both lists have the same number of entries.
+ *
+ * On error, dst folios already copied keep their FOLIO_CONTENT_COPIED
+ * marker, while the remaining folios fallback to per-folio CPU copy in
+ * the move phase.
+ *
+ * This function may sleep.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int migrate_folios_mc_copy(struct list_head *dst_list,
+		struct list_head *src_list,
+		unsigned int __always_unused folios_cnt)
+{
+	struct folio *src, *dst;
+	int ret;
+
+	dst = list_first_entry(dst_list, struct folio, lru);
+	list_for_each_entry(src, src_list, lru) {
+		ret = folio_mc_copy(dst, src);
+		if (ret)
+			return ret;
+		dst->migrate_info |= FOLIO_CONTENT_COPIED;
+		dst = list_next_entry(dst, lru);
+		cond_resched();
+	}
+
+	return 0;
+}
+
 static void migrate_folios_move(struct list_head *src_folios,
 		struct list_head *dst_folios,
 		free_folio_t put_new_folio, unsigned long private,
@@ -1840,9 +1900,13 @@ static int migrate_pages_batch(struct list_head *from,
 	bool is_large = false;
 	struct folio *folio, *folio2, *dst = NULL;
 	int rc, rc_saved = 0, nr_pages;
-	LIST_HEAD(unmap_folios);
-	LIST_HEAD(dst_folios);
+	unsigned int nr_batch = 0;
+	LIST_HEAD(unmap_batch);
+	LIST_HEAD(dst_batch);
+	LIST_HEAD(unmap_single);
+	LIST_HEAD(dst_single);
 	bool nosplit = (reason == MR_NUMA_MISPLACED);
+	bool offload = migrate_should_offload(reason);
 
 	VM_WARN_ON_ONCE(mode != MIGRATE_ASYNC &&
 			!list_empty(from) && !list_is_singular(from));
@@ -1936,8 +2000,8 @@ static int migrate_pages_batch(struct list_head *from,
 					private, folio, &dst, mode, ret_folios);
 			/*
 			 * The rules are:
-			 *	0: folio will be put on unmap_folios list,
-			 *	   dst folio put on dst_folios list
+			 *	0: folio put on unmap_batch or unmap_single,
+			 *	   dst folio put on dst_batch or dst_single
 			 *	-EAGAIN: stay on the from list
 			 *	-ENOMEM: stay on the from list
 			 *	Other errno: put on ret_folios list
@@ -1978,7 +2042,7 @@ static int migrate_pages_batch(struct list_head *from,
 				/* nr_failed isn't updated for not used */
 				stats->nr_thp_failed += thp_retry;
 				rc_saved = rc;
-				if (list_empty(&unmap_folios))
+				if (list_empty(&unmap_batch) && list_empty(&unmap_single))
 					goto out;
 				else
 					goto move;
@@ -1988,8 +2052,14 @@ static int migrate_pages_batch(struct list_head *from,
 				nr_retry_pages += nr_pages;
 				break;
 			case 0:
-				list_move_tail(&folio->lru, &unmap_folios);
-				list_add_tail(&dst->lru, &dst_folios);
+				if (offload && folio_can_batch_copy(folio)) {
+					list_move_tail(&folio->lru, &unmap_batch);
+					list_add_tail(&dst->lru, &dst_batch);
+					nr_batch++;
+				} else {
+					list_move_tail(&folio->lru, &unmap_single);
+					list_add_tail(&dst->lru, &dst_single);
+				}
 				break;
 			default:
 				/*
@@ -2012,17 +2082,26 @@ move:
 	/* Flush TLBs for all unmapped folios */
 	try_to_unmap_flush();
 
+	/* Batch-copy eligible folios before the move phase */
+	if (!list_empty(&unmap_batch))
+		migrate_folios_mc_copy(&dst_batch, &unmap_batch, nr_batch);
+
 	retry = 1;
 	for (pass = 0; pass < nr_pass && retry; pass++) {
 		retry = 0;
 		thp_retry = 0;
 		nr_retry_pages = 0;
 
-		/* Move the unmapped folios */
-		migrate_folios_move(&unmap_folios, &dst_folios,
-				put_new_folio, private, mode, reason,
-				ret_folios, stats, &retry, &thp_retry,
-				&nr_failed, &nr_retry_pages);
+		if (!list_empty(&unmap_batch))
+			migrate_folios_move(&unmap_batch, &dst_batch, put_new_folio,
+					private, mode, reason, ret_folios, stats,
+					&retry, &thp_retry, &nr_failed,
+					&nr_retry_pages);
+		if (!list_empty(&unmap_single))
+			migrate_folios_move(&unmap_single, &dst_single, put_new_folio,
+					private, mode, reason, ret_folios, stats,
+					&retry, &thp_retry, &nr_failed,
+					&nr_retry_pages);
 	}
 	nr_failed += retry;
 	stats->nr_thp_failed += thp_retry;
@@ -2031,7 +2110,9 @@ move:
 	rc = rc_saved ? : nr_failed;
 out:
 	/* Cleanup remaining folios */
-	migrate_folios_undo(&unmap_folios, &dst_folios,
+	migrate_folios_undo(&unmap_batch, &dst_batch,
+			put_new_folio, private, ret_folios);
+	migrate_folios_undo(&unmap_single, &dst_single,
 			put_new_folio, private, ret_folios);
 
 	return rc;
