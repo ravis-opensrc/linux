@@ -73,6 +73,31 @@ int folio_migrate_mapping(struct address_space *mapping,
 		struct folio *newfolio, struct folio *folio, int extra_count);
 int set_movable_ops(const struct movable_operations *ops, enum pagetype type);
 
+/*
+ * To record some information during migration, we use the migrate_info
+ * field of struct folio of the newly allocated destination folio,
+ * together with the anon_vma pointer. The state is encoded in the
+ * unused low bits of the pointer.
+ * This is safe because nobody is using it except us.
+ *
+ * FOLIO_WAS_MAPPED and FOLIO_WAS_MLOCKED record the src folios's state
+ * at unmap time and are consumed during the move/undo phase.
+ * FOLIO_CONTENT_COPIED tells __migrate_folio() that the folio contents
+ * have already been copied, so the per-folio copy can be skipped. A
+ * driver must set this bit on each dst folio it copied.
+ */
+enum {
+	FOLIO_WAS_MAPPED	= BIT(0),
+	FOLIO_WAS_MLOCKED	= BIT(1),
+	FOLIO_OLD_STATES	= FOLIO_WAS_MAPPED | FOLIO_WAS_MLOCKED,
+#ifdef CONFIG_64BIT
+	FOLIO_CONTENT_COPIED	= BIT(2),
+#else
+	/* On 32bit we do not have a spare bit, migration-copy offload is disabled. */
+	FOLIO_CONTENT_COPIED	= 0,
+#endif
+};
+
 #else
 
 static inline void putback_movable_pages(struct list_head *l) {}
