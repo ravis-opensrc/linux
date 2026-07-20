@@ -51,9 +51,17 @@ static DEFINE_PER_CPU(unsigned long, damon_report_ring_full_pf);
 static DEFINE_PER_CPU(unsigned long, damon_report_ring_full_perf);
 static DEFINE_PER_CPU(unsigned long, damon_report_busy_drop_pf);
 static DEFINE_PER_CPU(unsigned long, damon_report_busy_drop_perf);
-static DEFINE_PER_CPU(unsigned long, damon_samples_drained);
-static DEFINE_PER_CPU(unsigned long, damon_samples_stale_drained);
-static DEFINE_PER_CPU(unsigned long, damon_samples_no_region);
+/*
+ * Drain outcomes are counted per ring, like the drop counters above: a run
+ * with both primitives enabled feeds two rings, and the sums alone cannot say
+ * which of them a report came from.
+ */
+static DEFINE_PER_CPU(unsigned long, damon_samples_drained_pf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_drained_perf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_stale_drained_pf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_stale_drained_perf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_no_region_pf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_no_region_perf);
 
 static DEFINE_PER_CPU(struct damon_report_ring, damon_report_rings_pf);
 static DEFINE_PER_CPU(int, damon_report_ring_busy_pf);
@@ -63,6 +71,28 @@ static DEFINE_PER_CPU(int, damon_report_ring_busy_pf);
  * do NOT mark __read_mostly.  One pending mask per ring.
  */
 static cpumask_t damon_rings_pending_pf;
+
+unsigned long damon_get_report_ring_full_pf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_report_ring_full_pf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_report_ring_full_pf);
+
+unsigned long damon_get_report_ring_full_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_report_ring_full_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_report_ring_full_perf);
 
 unsigned long damon_get_report_ring_full(void)
 {
@@ -76,6 +106,28 @@ unsigned long damon_get_report_ring_full(void)
 	return sum;
 }
 EXPORT_SYMBOL_GPL(damon_get_report_ring_full);
+
+unsigned long damon_get_report_busy_drop_pf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_report_busy_drop_pf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_report_busy_drop_pf);
+
+unsigned long damon_get_report_busy_drop_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_report_busy_drop_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_report_busy_drop_perf);
 
 unsigned long damon_get_report_busy_drop(void)
 {
@@ -97,36 +149,89 @@ unsigned long damon_get_report_overflow(void)
 }
 EXPORT_SYMBOL_GPL(damon_get_report_overflow);
 
-unsigned long damon_get_samples_drained(void)
+unsigned long damon_get_samples_drained_pf(void)
 {
 	unsigned long sum = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu)
-		sum += per_cpu(damon_samples_drained, cpu);
+		sum += per_cpu(damon_samples_drained_pf, cpu);
 	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_drained_pf);
+
+unsigned long damon_get_samples_drained_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_samples_drained_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_drained_perf);
+
+unsigned long damon_get_samples_drained(void)
+{
+	return damon_get_samples_drained_pf() + damon_get_samples_drained_perf();
 }
 EXPORT_SYMBOL_GPL(damon_get_samples_drained);
 
-unsigned long damon_get_samples_stale_drained(void)
+unsigned long damon_get_samples_stale_drained_pf(void)
 {
 	unsigned long sum = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu)
-		sum += per_cpu(damon_samples_stale_drained, cpu);
+		sum += per_cpu(damon_samples_stale_drained_pf, cpu);
 	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_stale_drained_pf);
+
+unsigned long damon_get_samples_stale_drained_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_samples_stale_drained_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_stale_drained_perf);
+
+unsigned long damon_get_samples_stale_drained(void)
+{
+	return damon_get_samples_stale_drained_pf() +
+		damon_get_samples_stale_drained_perf();
 }
 EXPORT_SYMBOL_GPL(damon_get_samples_stale_drained);
 
-unsigned long damon_get_samples_no_region(void)
+unsigned long damon_get_samples_no_region_pf(void)
 {
 	unsigned long sum = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu)
-		sum += per_cpu(damon_samples_no_region, cpu);
+		sum += per_cpu(damon_samples_no_region_pf, cpu);
 	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_no_region_pf);
+
+unsigned long damon_get_samples_no_region_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_samples_no_region_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_no_region_perf);
+
+unsigned long damon_get_samples_no_region(void)
+{
+	return damon_get_samples_no_region_pf() +
+		damon_get_samples_no_region_perf();
 }
 EXPORT_SYMBOL_GPL(damon_get_samples_no_region);
 static DEFINE_MUTEX(damon_lock);
@@ -4859,7 +4964,7 @@ static bool damon_credit_report_bsearch(struct damon_region **regions,
 static void __kdamond_drain_ring(struct damon_ctx *ctx,
 		struct damon_target_lookup *tbl,
 		struct damon_report_ring __percpu *ring_pcpu,
-		cpumask_t *pending)
+		cpumask_t *pending, bool is_pf)
 {
 	int cpu;
 	struct damon_report_ring *ring;
@@ -4910,7 +5015,10 @@ static void __kdamond_drain_ring(struct damon_ctx *ctx,
 			stale_before = jiffies -
 				usecs_to_jiffies(ctx->attrs.sample_interval);
 			if (time_before(entry->report_jiffies, stale_before)) {
-				this_cpu_inc(damon_samples_stale_drained);
+				if (is_pf)
+					this_cpu_inc(damon_samples_stale_drained_pf);
+				else
+					this_cpu_inc(damon_samples_stale_drained_perf);
 				goto next;
 			}
 			pidx = entry->probe_idx;
@@ -4953,14 +5061,21 @@ static void __kdamond_drain_ring(struct damon_ctx *ctx,
 				if (damon_credit_report_bsearch(tbl[ti].regions,
 						tbl[ti].nr_regions, match_addr,
 						entry->size, pidx)) {
-					this_cpu_inc(damon_samples_drained);
+					if (is_pf)
+						this_cpu_inc(damon_samples_drained_pf);
+					else
+						this_cpu_inc(damon_samples_drained_perf);
 					found = true;
 					break;
 				}
 				ti++;
 			}
-			if (!found)
-				this_cpu_inc(damon_samples_no_region);
+			if (!found) {
+				if (is_pf)
+					this_cpu_inc(damon_samples_no_region_pf);
+				else
+					this_cpu_inc(damon_samples_no_region_perf);
+			}
 next:
 			tail = (tail + 1) & DAMON_REPORT_RING_MASK;
 		}
@@ -5003,10 +5118,10 @@ static void kdamond_check_reported_accesses(struct damon_ctx *ctx)
 
 	if (damon_drains_ring_pf(ctx))
 		__kdamond_drain_ring(ctx, tbl, &damon_report_rings_pf,
-				&damon_rings_pending_pf);
+				&damon_rings_pending_pf, true);
 	if (damon_drains_ring_perf(ctx))
 		__kdamond_drain_ring(ctx, tbl, ctx->perf_rings,
-				&ctx->perf_pending);
+				&ctx->perf_pending, false);
 }
 
 /*
