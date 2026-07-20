@@ -1440,6 +1440,17 @@ unsigned long damon_get_report_busy_drop(void);
 unsigned long damon_get_samples_drained(void);
 unsigned long damon_get_samples_stale_drained(void);
 unsigned long damon_get_samples_no_region(void);
+/* Same accounting, split by the ring the report came from. */
+unsigned long damon_get_report_ring_full_pf(void);
+unsigned long damon_get_report_ring_full_perf(void);
+unsigned long damon_get_report_busy_drop_pf(void);
+unsigned long damon_get_report_busy_drop_perf(void);
+unsigned long damon_get_samples_drained_pf(void);
+unsigned long damon_get_samples_drained_perf(void);
+unsigned long damon_get_samples_stale_drained_pf(void);
+unsigned long damon_get_samples_stale_drained_perf(void);
+unsigned long damon_get_samples_no_region_pf(void);
+unsigned long damon_get_samples_no_region_perf(void);
 #ifdef CONFIG_ACMA
 unsigned long damon_alloced_bytes(void);
 #endif

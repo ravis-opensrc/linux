@@ -51,9 +51,17 @@ static DEFINE_PER_CPU(unsigned long, damon_report_ring_full_pf);
 static DEFINE_PER_CPU(unsigned long, damon_report_ring_full_perf);
 static DEFINE_PER_CPU(unsigned long, damon_report_busy_drop_pf);
 static DEFINE_PER_CPU(unsigned long, damon_report_busy_drop_perf);
-static DEFINE_PER_CPU(unsigned long, damon_samples_drained);
-static DEFINE_PER_CPU(unsigned long, damon_samples_stale_drained);
-static DEFINE_PER_CPU(unsigned long, damon_samples_no_region);
+/*
+ * Drain outcomes are counted per ring, like the drop counters above: a run
+ * with both primitives enabled feeds two rings, and the sums alone cannot say
+ * which of them a report came from.
+ */
+static DEFINE_PER_CPU(unsigned long, damon_samples_drained_pf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_drained_perf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_stale_drained_pf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_stale_drained_perf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_no_region_pf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_no_region_perf);
 
 static DEFINE_PER_CPU(struct damon_report_ring, damon_report_rings_pf);
 static DEFINE_PER_CPU(int, damon_report_ring_busy_pf);
@@ -63,6 +71,28 @@ static DEFINE_PER_CPU(int, damon_report_ring_busy_pf);
  * do NOT mark __read_mostly.  One pending mask per ring.
  */
 static cpumask_t damon_rings_pending_pf;
+
+unsigned long damon_get_report_ring_full_pf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_report_ring_full_pf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_report_ring_full_pf);
+
+unsigned long damon_get_report_ring_full_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_report_ring_full_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_report_ring_full_perf);
 
 unsigned long damon_get_report_ring_full(void)
 {
@@ -77,16 +107,16 @@ unsigned long damon_get_report_ring_full(void)
 }
 EXPORT_SYMBOL_GPL(damon_get_report_ring_full);
 
-unsigned long damon_get_report_ring_full_perf(void)
+unsigned long damon_get_report_busy_drop_perf(void)
 {
 	unsigned long sum = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu)
-		sum += per_cpu(damon_report_ring_full_perf, cpu);
+		sum += per_cpu(damon_report_busy_drop_perf, cpu);
 	return sum;
 }
-EXPORT_SYMBOL_GPL(damon_get_report_ring_full_perf);
+EXPORT_SYMBOL_GPL(damon_get_report_busy_drop_perf);
 
 unsigned long damon_get_report_busy_drop(void)
 {
@@ -108,36 +138,89 @@ unsigned long damon_get_report_overflow(void)
 }
 EXPORT_SYMBOL_GPL(damon_get_report_overflow);
 
-unsigned long damon_get_samples_drained(void)
+unsigned long damon_get_samples_drained_pf(void)
 {
 	unsigned long sum = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu)
-		sum += per_cpu(damon_samples_drained, cpu);
+		sum += per_cpu(damon_samples_drained_pf, cpu);
 	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_drained_pf);
+
+unsigned long damon_get_samples_drained_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_samples_drained_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_drained_perf);
+
+unsigned long damon_get_samples_drained(void)
+{
+	return damon_get_samples_drained_pf() + damon_get_samples_drained_perf();
 }
 EXPORT_SYMBOL_GPL(damon_get_samples_drained);
 
-unsigned long damon_get_samples_stale_drained(void)
+unsigned long damon_get_samples_stale_drained_pf(void)
 {
 	unsigned long sum = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu)
-		sum += per_cpu(damon_samples_stale_drained, cpu);
+		sum += per_cpu(damon_samples_stale_drained_pf, cpu);
 	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_stale_drained_pf);
+
+unsigned long damon_get_samples_stale_drained_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_samples_stale_drained_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_stale_drained_perf);
+
+unsigned long damon_get_samples_stale_drained(void)
+{
+	return damon_get_samples_stale_drained_pf() +
+		damon_get_samples_stale_drained_perf();
 }
 EXPORT_SYMBOL_GPL(damon_get_samples_stale_drained);
 
-unsigned long damon_get_samples_no_region(void)
+unsigned long damon_get_samples_no_region_pf(void)
 {
 	unsigned long sum = 0;
 	int cpu;
 
 	for_each_possible_cpu(cpu)
-		sum += per_cpu(damon_samples_no_region, cpu);
+		sum += per_cpu(damon_samples_no_region_pf, cpu);
 	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_no_region_pf);
+
+unsigned long damon_get_samples_no_region_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_samples_no_region_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_no_region_perf);
+
+unsigned long damon_get_samples_no_region(void)
+{
+	return damon_get_samples_no_region_pf() +
+		damon_get_samples_no_region_perf();
 }
 EXPORT_SYMBOL_GPL(damon_get_samples_no_region);
 static DEFINE_MUTEX(damon_lock);
@@ -147,15 +230,10 @@ static bool running_exclusive_ctxs;
 /*
  * Single-consumer owner of each global report ring.  A ring is a destructive
  * SPSC channel that must be drained by exactly one kdamond.  The pf ring is
- * claimed by the (single) ctx whose page_fault primitive is enabled; the perf
- * ring by the (single) ctx that has event-driven probes.  Because the two
- * rings are independent, they have independent owners: distinct ctxs may
- * concurrently own the pf ring and the perf ring, but no ring may be shared
- * by two draining ctxs.  Accessed only under damon_lock.
+ * claimed by the (single) ctx whose page_fault primitive is enabled.
  *
- * Only the pf ring has a global owner: it is a global ring with no ctx at
- * report time.  The perf ring is per-ctx (ctx->perf_rings), so it needs no
- * cross-ctx owner -- each ctx drains exclusively its own perf ring.
+ * The perf ring is per-ctx (ctx->perf_rings), so it needs no global owner:
+ * each ctx drains exclusively its own perf ring.
  */
 static struct damon_ctx *damon_report_ring_owner_pf;
 
@@ -2677,8 +2755,8 @@ int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive)
 
 	/*
 	 * Each global report ring is drained by exactly one kdamond.  Claim the
-	 * pf and perf ring owners independently; distinct ctxs may own the two
-	 * rings, but neither ring may be shared by two draining ctxs.  Remember
+	 * pf ring owner; the perf ring is per-ctx and needs no global owner.
+	 * Neither ring may be shared by two draining ctxs.  Remember
 	 * whether this batch newly set each owner so the failure paths release
 	 * only those, never another batch's still-running owner.
 	 */
@@ -3014,7 +3092,7 @@ void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 {
 	struct damon_access_report access_report = {
 		.vaddr = vmf->address,
-		.size = 1,	/* todo: set appripriately */
+		.size = 1,	/* size 1: report a single access point without a page-aligned range */
 		.tid = task_pid_vnr(current),
 		.tgid = task_tgid_vnr(current),
 		.is_write = vmf->flags & FAULT_FLAG_WRITE,
@@ -4900,7 +4978,7 @@ static bool damon_credit_report_bsearch(struct damon_region **regions,
 static void __kdamond_drain_ring(struct damon_ctx *ctx,
 		struct damon_target_lookup *tbl,
 		struct damon_report_ring __percpu *ring_pcpu,
-		cpumask_t *pending)
+		cpumask_t *pending, bool is_pf)
 {
 	int cpu;
 	struct damon_report_ring *ring;
@@ -4951,7 +5029,10 @@ static void __kdamond_drain_ring(struct damon_ctx *ctx,
 			stale_before = jiffies -
 				usecs_to_jiffies(ctx->attrs.sample_interval);
 			if (time_before(entry->report_jiffies, stale_before)) {
-				this_cpu_inc(damon_samples_stale_drained);
+				if (is_pf)
+					this_cpu_inc(damon_samples_stale_drained_pf);
+				else
+					this_cpu_inc(damon_samples_stale_drained_perf);
 				goto next;
 			}
 			pidx = entry->probe_idx;
@@ -4959,10 +5040,10 @@ static void __kdamond_drain_ring(struct damon_ctx *ctx,
 			 * probe_idx == 0 (DAMON_PROBE_IDX_NONE) is the
 			 * page_fault / non-probe credit path: no probe_hits[]
 			 * slot, but it still credits the region access rate.
-			 * Reject only out-of-range indices (>= DAMON_MAX_PROBES)
+			 * Reject only out-of-range indices (> DAMON_MAX_PROBES)
 			 * and, defensively, any negative value.
 			 */
-			if (pidx < 0 || pidx >= DAMON_MAX_PROBES)
+			if (pidx < 0 || pidx > DAMON_MAX_PROBES)
 				goto next;
 
 			/* Drop reports rejected by the ctx sample filters. */
@@ -4994,14 +5075,21 @@ static void __kdamond_drain_ring(struct damon_ctx *ctx,
 				if (damon_credit_report_bsearch(tbl[ti].regions,
 						tbl[ti].nr_regions, match_addr,
 						entry->size, pidx)) {
-					this_cpu_inc(damon_samples_drained);
+					if (is_pf)
+						this_cpu_inc(damon_samples_drained_pf);
+					else
+						this_cpu_inc(damon_samples_drained_perf);
 					found = true;
 					break;
 				}
 				ti++;
 			}
-			if (!found)
-				this_cpu_inc(damon_samples_no_region);
+			if (!found) {
+				if (is_pf)
+					this_cpu_inc(damon_samples_no_region_pf);
+				else
+					this_cpu_inc(damon_samples_no_region_perf);
+			}
 next:
 			tail = (tail + 1) & DAMON_REPORT_RING_MASK;
 		}
@@ -5044,10 +5132,10 @@ static void kdamond_check_reported_accesses(struct damon_ctx *ctx)
 
 	if (damon_drains_ring_pf(ctx))
 		__kdamond_drain_ring(ctx, tbl, &damon_report_rings_pf,
-				&damon_rings_pending_pf);
+				&damon_rings_pending_pf, true);
 	if (damon_drains_ring_perf(ctx))
 		__kdamond_drain_ring(ctx, tbl, ctx->perf_rings,
-				&ctx->perf_pending);
+				&ctx->perf_pending, false);
 }
 
 /*
@@ -5107,8 +5195,8 @@ static int kdamond_fn(void *data)
 		ctx->passed_sample_intervals++;
 
 		/*
-		 * Both perf-event and page-fault primitives feed damon_report_access()
-		 * into the global per-CPU ring; the same drain consumes both.
+		 * perf-event reports go to the per-ctx perf ring; page-fault reports
+		 * go to the global pf ring.  Both are drained here via their ring predicates.
 		 */
 		if (damon_drains_ring_perf(ctx) || damon_drains_ring_pf(ctx))
 			kdamond_check_reported_accesses(ctx);
