@@ -30,6 +30,110 @@ static DEFINE_PER_CPU(unsigned long, damon_perf_samples_filtered);
 static DEFINE_PER_CPU(unsigned long, damon_perf_samples_no_addr);
 
 
+#ifdef CONFIG_DEBUG_FS
+#include <linux/debugfs.h>
+
+static struct dentry *damon_perf_debugfs_dir;
+
+static unsigned long damon_perf_get_samples_total(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_perf_samples_total, cpu);
+	return sum;
+}
+
+static unsigned long damon_perf_get_samples_filtered(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_perf_samples_filtered, cpu);
+	return sum;
+}
+
+static unsigned long damon_perf_get_samples_no_addr(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_perf_samples_no_addr, cpu);
+	return sum;
+}
+
+static int damon_perf_debugfs_show(struct seq_file *m, void *v)
+{
+	const char *name = m->private;
+
+	if (strcmp(name, "report_overflow") == 0)
+		seq_printf(m, "%lu\n", damon_get_report_overflow());
+	else if (strcmp(name, "report_ring_full") == 0)
+		seq_printf(m, "%lu\n", damon_get_report_ring_full());
+	else if (strcmp(name, "report_busy_drop") == 0)
+		seq_printf(m, "%lu\n", damon_get_report_busy_drop());
+	else if (strcmp(name, "samples_drained") == 0)
+		seq_printf(m, "%lu\n", damon_get_samples_drained());
+	else if (strcmp(name, "samples_stale_drained") == 0)
+		seq_printf(m, "%lu\n", damon_get_samples_stale_drained());
+	else if (strcmp(name, "samples_no_region") == 0)
+		seq_printf(m, "%lu\n", damon_get_samples_no_region());
+	else if (strcmp(name, "samples_total") == 0)
+		seq_printf(m, "%lu\n", damon_perf_get_samples_total());
+	else if (strcmp(name, "samples_filtered") == 0)
+		seq_printf(m, "%lu\n", damon_perf_get_samples_filtered());
+	else if (strcmp(name, "samples_no_addr") == 0)
+		seq_printf(m, "%lu\n", damon_perf_get_samples_no_addr());
+	return 0;
+}
+
+static int damon_perf_debugfs_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, damon_perf_debugfs_show, inode->i_private);
+}
+
+static const struct file_operations damon_perf_debugfs_fops = {
+	.owner = THIS_MODULE,
+	.open = damon_perf_debugfs_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static void damon_perf_debugfs_init(void)
+{
+	damon_perf_debugfs_dir = debugfs_create_dir("damon_perf", NULL);
+	debugfs_create_file("report_overflow", 0444, damon_perf_debugfs_dir,
+			    "report_overflow", &damon_perf_debugfs_fops);
+	debugfs_create_file("report_ring_full", 0444, damon_perf_debugfs_dir,
+			    "report_ring_full", &damon_perf_debugfs_fops);
+	debugfs_create_file("report_busy_drop", 0444, damon_perf_debugfs_dir,
+			    "report_busy_drop", &damon_perf_debugfs_fops);
+	debugfs_create_file("samples_drained", 0444, damon_perf_debugfs_dir,
+			    "samples_drained", &damon_perf_debugfs_fops);
+	debugfs_create_file("samples_stale_drained", 0444, damon_perf_debugfs_dir,
+			    "samples_stale_drained", &damon_perf_debugfs_fops);
+	debugfs_create_file("samples_no_region", 0444, damon_perf_debugfs_dir,
+			    "samples_no_region", &damon_perf_debugfs_fops);
+	debugfs_create_file("samples_total", 0444, damon_perf_debugfs_dir,
+			    "samples_total", &damon_perf_debugfs_fops);
+	debugfs_create_file("samples_filtered", 0444, damon_perf_debugfs_dir,
+			    "samples_filtered", &damon_perf_debugfs_fops);
+	debugfs_create_file("samples_no_addr", 0444, damon_perf_debugfs_dir,
+			    "samples_no_addr", &damon_perf_debugfs_fops);
+}
+
+static void damon_perf_debugfs_cleanup(void)
+{
+	debugfs_remove_recursive(damon_perf_debugfs_dir);
+}
+#else
+static inline void damon_perf_debugfs_init(void) {}
+static inline void damon_perf_debugfs_cleanup(void) {}
+#endif /* CONFIG_DEBUG_FS */
 static void damon_perf_overflow(struct perf_event *perf_event,
 				struct perf_sample_data *data,
 				struct pt_regs *regs)
@@ -474,6 +578,7 @@ static int __init damon_perf_source_init(void)
 	if (ret < 0)
 		return ret;
 	damon_perf_cpuhp_state = ret;
+	damon_perf_debugfs_init();
 	return 0;
 }
 
@@ -486,6 +591,7 @@ static void __exit damon_perf_source_exit(void)
 		return;
 	}
 	spin_unlock(&damon_pmu_owner_lock);
+	damon_perf_debugfs_cleanup();
 	cpuhp_remove_multi_state(damon_perf_cpuhp_state);
 }
 
