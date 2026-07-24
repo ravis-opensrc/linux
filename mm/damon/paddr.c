@@ -175,6 +175,16 @@ static void damon_pa_prep_probes_region(struct damon_region *r,
 {
 	struct damon_prep *p;
 
+	/*
+	 * Event-driven probes have no software prep action: their hits arrive
+	 * asynchronously through the per-CPU report rings and are applied by
+	 * the kdamond ring drain, so skip the software prep path here.
+	 * Reaching this for an event-driven probe is normal (prep runs for
+	 * every probe); it is silently skipped, not a warning.
+	 */
+	if (probe->event_driven)
+		return;
+
 	damon_for_each_prep(p, probe) {
 		switch (p->action) {
 		case DAMON_PREP_SET_PGIDLE:
@@ -258,7 +268,14 @@ static unsigned int damon_pa_apply_probes(struct damon_ctx *ctx,
 					ctx->addr_unit);
 			folio = damon_get_folio(PHYS_PFN(pa));
 			damon_for_each_probe(p, ctx) {
-				if (damon_pa_filter_pass(folio, p))
+				/*
+				 * Event-driven probes skip this software apply
+				 * path; their hits are counted asynchronously by
+				 * the kdamond ring drain.  Only sampling-based
+				 * probes credit probe_hits[] here.
+				 */
+				if (!p->event_driven &&
+				    damon_pa_filter_pass(folio, p))
 					r->probe_hits[i]++;
 				i++;
 			}
