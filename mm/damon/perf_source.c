@@ -14,48 +14,47 @@
 #include <linux/slab.h>
 #include "perf_source.h"
 
-/* PMU event attribute for perf-event probe configuration */
-struct damon_perf_event_attr {
-	u32 type;
-	u64 config;
-	u64 config1;
-	u64 config2;
-	bool sample_phys_addr;
-	bool sample_weight_struct;
-	bool exclude_kernel;
-	bool exclude_hv;
-	bool freq;
-	u64 sample_freq;
-	u64 sample_period;
-	u32 wakeup_events;
-	u32 precise_ip;
-};
-
-struct damon_perf_probe_event {
-	struct damon_perf_event_attr attr;
-	void *priv;		/* struct damon_perf_probe_state * */
-	struct hlist_node hlist_node;
-	int probe_idx;		/* index into probe_hits[]; set at registration */
-};
+/*
+ * struct damon_perf_event_attr and struct damon_perf_probe_event are defined
+ * in perf_source.h so that the sysfs configuration surface can build a probe
+ * event descriptor before handing it to damon_perf_probe_setup().
+ */
 
 struct damon_perf_probe_state {
-	struct perf_event * __percpu *event;
+	struct perf_event * __percpu *event;	/* per-CPU probes (PEBS/IBS) */
 };
 
 static DEFINE_PER_CPU(unsigned long, damon_perf_samples_total);
 static DEFINE_PER_CPU(unsigned long, damon_perf_samples_filtered);
 static DEFINE_PER_CPU(unsigned long, damon_perf_samples_no_addr);
 
+
 static void damon_perf_overflow(struct perf_event *perf_event,
 				struct perf_sample_data *data,
 				struct pt_regs *regs)
 {
-	int probe_idx = (int)(unsigned long)perf_event->overflow_handler_context;
+	struct damon_perf_probe_event *event =
+		(struct damon_perf_probe_event *)perf_event->overflow_handler_context;
+	int probe_idx;
+	struct damon_ctx *ctx;
 	struct damon_access_report report = {
-		.probe_idx = probe_idx,
 		.size = PAGE_SIZE,
 		.cpu = smp_processor_id(),
 	};
+
+	/*
+	 * Teardown NULLs event->ctx (with a release barrier) before releasing
+	 * the per-CPU perf events, so an in-flight overflow racing the
+	 * disable/release observes the torn-down state and drops the sample
+	 * instead of reporting into a freed ctx.  Pairs with the
+	 * smp_store_release(&event->ctx, NULL) in damon_perf_probe_teardown().
+	 */
+	ctx = smp_load_acquire(&event->ctx);
+	if (!ctx)
+		return;
+	probe_idx = event->probe_idx;
+	report.probe_idx = probe_idx;
+	report.ctx = ctx;	/* route to this ctx's per-ctx perf ring */
 
 	/* probe_idx 0 is the zero-init sentinel; a valid index must be >= 1 */
 	if (WARN_ONCE(probe_idx == 0,
@@ -98,8 +97,7 @@ static enum cpuhp_state damon_perf_cpuhp_state;
 
 /*
  * Per-PMU exclusivity: each PMU type may be owned by at most one damon_ctx.
- * Multiple probes from the same ctx sharing a PMU type are allowed; a second
- * ctx attempting to grab a PMU type already owned returns -EBUSY.
+ * Multiple probes from the same ctx sharing a PMU type are allowed.
  */
 struct damon_pmu_owner {
 	struct list_head node;
@@ -165,7 +163,7 @@ static int damon_perf_cpu_online(unsigned int cpu, struct hlist_node *node)
 
 	perf_event = perf_event_create_kernel_counter(&attr, cpu, NULL,
 						      damon_perf_overflow,
-						      (void *)(unsigned long)event->probe_idx);
+						      event);
 	if (IS_ERR(perf_event)) {
 		pr_warn_ratelimited("damon-perf: cpu %u event create failed: %ld\n",
 				    cpu, PTR_ERR(perf_event));
@@ -218,6 +216,10 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 	 * Per-PMU exclusivity: find or create an owner slot for this PMU type.
 	 * Multiple probes from the same ctx sharing a PMU type are allowed;
 	 * a second ctx attempting the same PMU type returns -EBUSY.
+	 *
+	 * NOTE: damon_commit_perf_probe() updates perf_event parameters
+	 * in-place and never calls damon_perf_probe_setup(), so the owner
+	 * table is never touched on the commit path.
 	 */
 	spin_lock(&damon_pmu_owner_lock);
 	list_for_each_entry(owner, &damon_pmu_owner_list, node) {
@@ -269,16 +271,26 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 		goto release_owner;
 	}
 	event->probe_idx = idx + 1;	/* 1-based; 0 is reserved sentinel */
+	event->ctx = ctx;		/* route overflow reports to this ctx */
+
+	/*
+	 * Allocate the ctx's per-ctx perf report ring before arming any event,
+	 * so the overflow handler always finds a ready ring.  Idempotent across
+	 * a ctx's multiple probes.
+	 */
+	err = damon_ctx_alloc_perf_ring(ctx);
+	if (err)
+		goto release_owner;
 
 	perf = kzalloc_obj(*perf, GFP_KERNEL);
 	if (!perf)
 		goto release_owner;
+	event->priv = perf;
 
 	perf->event = alloc_percpu(typeof(*perf->event));
 	if (!perf->event)
 		goto free_perf;
 
-	event->priv = perf;
 	INIT_HLIST_NODE(&event->hlist_node);
 
 	err = cpuhp_state_add_instance(damon_perf_cpuhp_state,
@@ -308,45 +320,64 @@ EXPORT_SYMBOL_GPL(damon_perf_probe_setup);
 
 /**
  * damon_perf_probe_teardown - disarm perf_events.
+ * @ctx: DAMON context that owns the probe (used to release per-PMU ownership).
  * @event: perf event descriptor previously passed to damon_perf_probe_setup()
  */
 void damon_perf_probe_teardown(struct damon_ctx *ctx,
 			       struct damon_perf_probe_event *event)
 {
 	struct damon_perf_probe_state *perf = event->priv;
-	struct damon_pmu_owner *owner, *tmp;
 
-	if (!perf)
-		return;
+	if (perf) {
+		struct damon_pmu_owner *owner, *tmp;
 
-	cpuhp_state_remove_instance(damon_perf_cpuhp_state,
-				    &event->hlist_node);
-	free_percpu(perf->event);
-	kfree(perf);
-	event->priv = NULL;
+		/*
+		 * Signal in-flight NMI overflow handlers to drop samples
+		 * before tearing down the perf events and freeing their
+		 * backing state.  Pairs with smp_load_acquire(&event->ctx)
+		 * in damon_perf_overflow().  This applies to both the per-CPU
+		 * and single-instance paths: a single-instance counter can
+		 * also deliver an overflow racing teardown.
+		 */
+		smp_store_release(&event->ctx, NULL);
 
-	/*
-	 * Release per-PMU ownership when the last probe for this
-	 * ctx/PMU-type pair is torn down.
-	 */
-	spin_lock(&damon_pmu_owner_lock);
-	list_for_each_entry_safe(owner, tmp, &damon_pmu_owner_list, node) {
-		if (owner->pmu_type == event->attr.type &&
-		    atomic_long_read(&owner->owner_ctx) == (long)ctx) {
-			/*
-			 * Free under the lock so a concurrent same-PMU teardown
-			 * cannot observe and free the same owner
-			 * (use-after-free/double-free).  kfree() under a non-irq
-			 * spinlock in process context is safe.
-			 */
-			if (atomic_dec_and_test(&owner->refcount)) {
-				list_del(&owner->node);
-				kfree(owner);
+		/*
+		 * cpuhp_state_remove_instance() disables+releases each
+		 * CPU's perf event; once it returns no new overflow can
+		 * be delivered for this event.
+		 */
+		cpuhp_state_remove_instance(damon_perf_cpuhp_state,
+					    &event->hlist_node);
+		free_percpu(perf->event);
+		kfree(perf);
+		event->priv = NULL;
+
+		/*
+		 * Release per-PMU ownership when the last probe for this
+		 * ctx/PMU-type pair is torn down.
+		 */
+		spin_lock(&damon_pmu_owner_lock);
+		list_for_each_entry_safe(owner, tmp, &damon_pmu_owner_list, node) {
+			if (owner->pmu_type == event->attr.type &&
+			    atomic_long_read(&owner->owner_ctx) == (long)ctx) {
+				/*
+				 * Free under the lock so a concurrent
+				 * same-PMU teardown cannot observe and free
+				 * the same owner (use-after-free/double-free).
+				 * kfree() under a non-irq spinlock in process
+				 * context is safe.
+				 */
+				if (atomic_dec_and_test(&owner->refcount)) {
+					list_del(&owner->node);
+					kfree(owner);
+				}
+				break;
 			}
-			break;
 		}
+		spin_unlock(&damon_pmu_owner_lock);
 	}
-	spin_unlock(&damon_pmu_owner_lock);
+	/* teardown owns the event allocation */
+	kfree(event);
 }
 EXPORT_SYMBOL_GPL(damon_perf_probe_teardown);
 
