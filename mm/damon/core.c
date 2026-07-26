@@ -5111,6 +5111,27 @@ static int kdamond_fn(void *data)
 done:
 	damon_destroy_targets(ctx);
 
+#ifdef CONFIG_DAMON_PERF_SOURCE
+	/*
+	 * Release perf-event probes on the off transition, not only on ctx
+	 * destroy.  Otherwise a perf-backed event (e.g. a single-instance,
+	 * counter) keeps firing overflows into the stopped kdamond's report
+	 * ring and stays owned (pinning its provider module) until the ctx is
+	 * destroyed via nr_kdamonds=0.  This runs in kdamond context, so the
+	 * provider's sleeping teardown is safe here.
+	 */
+	{
+		struct damon_probe *p, *next_p;
+
+		damon_for_each_probe_safe(p, next_p, ctx) {
+			if (p->perf_priv) {
+				damon_perf_probe_teardown(ctx, p->perf_priv);
+				p->perf_priv = NULL;
+			}
+		}
+	}
+#endif
+
 	kfree(ctx->regions_score_histogram);
 	mutex_lock(&ctx->call_controls_lock);
 	ctx->call_controls_obsolete = true;
