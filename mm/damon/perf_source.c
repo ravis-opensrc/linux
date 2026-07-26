@@ -22,6 +22,7 @@
 
 struct damon_perf_probe_state {
 	struct perf_event * __percpu *event;	/* per-CPU probes (PEBS/IBS) */
+	struct perf_event *single_event;	/* single-instance probes (system-wide PMU) */
 };
 
 static DEFINE_PER_CPU(unsigned long, damon_perf_samples_total);
@@ -287,6 +288,47 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 		goto release_owner;
 	event->priv = perf;
 
+	/*
+	 * A system-wide PMU is a single hardware unit, not a
+	 * per-CPU counter.  Opening it once per online CPU -- as the cpuhp path
+	 * below does for genuine per-CPU PMUs (PEBS/IBS) -- would run N redundant
+	 * samplers against the one device and corrupt its shared state.  So open
+	 * exactly one counter, pinned to a fixed online CPU, and bypass cpuhp.
+	 *
+	 * The PMU is perf_invalid_context, so the counter must be pinned to a
+	 * real CPU (>= 0); cpu = -1 would route to task context.  If that CPU is
+	 * later offlined the counter stops and is not migrated -- acceptable for
+	 * a dedicated monitoring host that does not hotplug CPUs.
+	 */
+	if (event->attr.single_instance) {
+		struct perf_event_attr attr;
+		int cpu = cpumask_first(cpu_online_mask);
+
+		damon_perf_event_init_attr(event, &attr);
+		/*
+		 * Pass @event (not a probe_idx cookie) as the overflow context:
+		 * damon_perf_overflow() casts it to damon_perf_probe_event* and
+		 * reads event->ctx via smp_load_acquire() for the teardown race
+		 * barrier, same as the per-CPU path (damon_perf_cpu_online()).
+		 */
+		perf->single_event = perf_event_create_kernel_counter(&attr, cpu,
+				NULL, damon_perf_overflow, event);
+		if (IS_ERR(perf->single_event)) {
+			err = PTR_ERR(perf->single_event);
+			perf->single_event = NULL;
+			pr_warn("damon-perf: single-instance event create failed: %d\n",
+				err);
+			goto free_perf;
+		}
+		/*
+		 * Ownership is already held via the per-PMU owner->refcount
+		 * acquired at the top of setup; the single-instance path shares
+		 * that slot, so no separate refcount is taken here.  Teardown
+		 * releases it through the same owner list as the per-CPU path.
+		 */
+		return 0;
+	}
+
 	perf->event = alloc_percpu(typeof(*perf->event));
 	if (!perf->event)
 		goto free_perf;
@@ -341,14 +383,26 @@ void damon_perf_probe_teardown(struct damon_ctx *ctx,
 		 */
 		smp_store_release(&event->ctx, NULL);
 
-		/*
-		 * cpuhp_state_remove_instance() disables+releases each
-		 * CPU's perf event; once it returns no new overflow can
-		 * be delivered for this event.
-		 */
-		cpuhp_state_remove_instance(damon_perf_cpuhp_state,
-					    &event->hlist_node);
-		free_percpu(perf->event);
+		if (perf->single_event) {
+			/*
+			 * Single-instance probe: no cpuhp instance was added, so
+			 * just release the one counter (process context here, so
+			 * disable+release is safe).  disable() also quiesces any
+			 * pending overflow before release.
+			 */
+			perf_event_disable(perf->single_event);
+			perf_event_release_kernel(perf->single_event);
+			perf->single_event = NULL;
+		} else {
+			/*
+			 * cpuhp_state_remove_instance() disables+releases each
+			 * CPU's perf event; once it returns no new overflow can
+			 * be delivered for this event.
+			 */
+			cpuhp_state_remove_instance(damon_perf_cpuhp_state,
+						    &event->hlist_node);
+			free_percpu(perf->event);
+		}
 		kfree(perf);
 		event->priv = NULL;
 
