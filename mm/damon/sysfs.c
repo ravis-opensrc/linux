@@ -772,6 +772,7 @@ struct damon_sysfs_prep {
 	bool exclude_kernel;
 	bool exclude_hv;
 	bool freq;
+	bool single_instance;
 };
 
 static struct damon_sysfs_prep *damon_sysfs_prep_alloc(void)
@@ -847,6 +848,7 @@ static void damon_sysfs_prep_release(struct kobject *kobj)
 
 	kfree(prep);
 }
+
 
 static struct kobj_attribute damon_sysfs_prep_prep_action_attr =
 		__ATTR_RW_MODE(prep_action, 0600);
@@ -949,6 +951,7 @@ DAMON_SYSFS_PREP_PERF_BOOL(sample_weight_struct, sample_weight_struct);
 DAMON_SYSFS_PREP_PERF_BOOL(exclude_kernel, exclude_kernel);
 DAMON_SYSFS_PREP_PERF_BOOL(exclude_hv, exclude_hv);
 DAMON_SYSFS_PREP_PERF_BOOL(freq, freq);
+DAMON_SYSFS_PREP_PERF_BOOL(single_instance, single_instance);
 
 static struct attribute *damon_sysfs_prep_attrs[] = {
 	&damon_sysfs_prep_prep_action_attr.attr,
@@ -965,6 +968,7 @@ static struct attribute *damon_sysfs_prep_attrs[] = {
 	&damon_sysfs_prep_exclude_kernel_attr.attr,
 	&damon_sysfs_prep_exclude_hv_attr.attr,
 	&damon_sysfs_prep_freq_attr.attr,
+	&damon_sysfs_prep_single_instance_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(damon_sysfs_prep);
@@ -2370,6 +2374,7 @@ static int damon_sysfs_set_preps(struct damon_probe *probe,
 			prep->perf.exclude_kernel = sys_prep->exclude_kernel;
 			prep->perf.exclude_hv = sys_prep->exclude_hv;
 			prep->perf.freq = sys_prep->freq;
+			prep->perf.single_instance = sys_prep->single_instance;
 		}
 		damon_add_prep(probe, prep);
 	}
@@ -2449,6 +2454,7 @@ static int damon_sysfs_set_perf_probe(struct damon_ctx *ctx,
 		event->attr.exclude_kernel = prep->perf.exclude_kernel;
 		event->attr.exclude_hv = prep->perf.exclude_hv;
 		event->attr.freq = prep->perf.freq;
+		event->attr.single_instance = prep->perf.single_instance;
 
 		probe->perf_priv = event;
 		probe->event_driven = true;
@@ -2514,6 +2520,7 @@ static int damon_sysfs_set_probes(struct damon_ctx *ctx,
 		err = damon_sysfs_set_probe(ctx, p, sys_probe, arm);
 		if (err)
 			return err;
+
 	}
 	return 0;
 }

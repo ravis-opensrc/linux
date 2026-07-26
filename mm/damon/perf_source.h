@@ -28,6 +28,7 @@ struct damon_perf_event_attr {
 	bool exclude_kernel;
 	bool exclude_hv;
 	bool freq;
+	bool single_instance;	/* system-wide PMU: open one counter, not per-CPU */
 	u64 sample_freq;
 	u64 sample_period;
 	u32 wakeup_events;

@@ -901,6 +901,7 @@ struct damon_prep {
 		bool exclude_kernel;
 		bool exclude_hv;
 		bool freq;
+		bool single_instance;
 	} perf;
 /* private: */
 	/* siblings list. */
