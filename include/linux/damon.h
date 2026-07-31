@@ -6,6 +6,7 @@
 #ifndef _DAMON_H_
 #define _DAMON_H_
 
+#include <asm/local.h>
 #include <linux/math64.h>
 #include <linux/memcontrol.h>
 #include <linux/mutex.h>
@@ -17,8 +18,18 @@
 #define DAMON_MIN_REGION_SZ	PAGE_SIZE
 /* Maximum number of monitoring probes. */
 #define DAMON_MAX_PROBES	(4)
+/*
+ * Sentinel value for damon_access_report.probe_idx: 0 means no probe
+ * attribution (matches zero-init of struct damon_access_report on the stack).
+ * Perf-event probe indices start at 1.
+ */
+#define DAMON_PROBE_IDX_NONE	0
 /* Max priority score for DAMON-based operation schemes */
 #define DAMOS_MAX_SCORE		(99)
+
+/* Per-CPU SPSC ring: size must be a power of two. */
+#define DAMON_REPORT_RING_SIZE	256
+#define DAMON_REPORT_RING_MASK	(DAMON_REPORT_RING_SIZE - 1)
 
 /**
  * struct damon_addr_range - Represents an address region of [@start, @end).
@@ -111,6 +122,11 @@ struct damon_target {
  * @cpu:		The id of the CPU that made the access.
  * @tid:		The task id of the task that made the access.
  * @is_write:		Whether the access is write.
+ * @probe_idx:		Index into probe_hits[] for the reporting probe; set by
+ *			the perf-event overflow handler so the drain can credit
+ *			the correct slot without a list walk.
+ *			0 is reserved (no probe attribution; matches zero-init);
+ *			perf-event probe indices start at 1.
  *
  * Any DAMON API callers that notified access events can report the information
  * to DAMON using damon_report_access().  This struct contains the reporting
@@ -123,8 +139,48 @@ struct damon_access_report {
 	unsigned int cpu;
 	pid_t tid;
 	bool is_write;
+	int probe_idx;
+	/*
+	 * Owning context for perf-event reports (probe_idx >= 1): the overflow
+	 * handler sets this so the producer enqueues into that ctx's own perf
+	 * ring.  NULL for page_fault reports (probe_idx == DAMON_PROBE_IDX_NONE),
+	 * which route to the global pf ring by address at drain time.
+	 */
+	struct damon_ctx *ctx;
 /* private: */
 	unsigned long report_jiffies;	/* when this report is made */
+};
+
+/**
+ * struct damon_report_ring - Per-CPU SPSC ring for NMI-safe access reports.
+ *
+ * @head:	Write index; updated by the NMI producer.
+ * @tail:	Read index; updated by the kdamond consumer.
+ * @entries:	Ring buffer entries.
+ *
+ * One ring per CPU per context.  The producer (NMI overflow handler) writes
+ * to @head; the consumer (kdamond) reads from @tail.  Both indices are
+ * unsigned and wrap modulo DAMON_REPORT_RING_SIZE.
+ */
+struct damon_report_ring {
+	unsigned int head;	/* written by producer (NMI) */
+	unsigned int tail	/* written by consumer (kdamond) */
+		____cacheline_aligned_in_smp;
+	struct damon_access_report entries[DAMON_REPORT_RING_SIZE]
+		____cacheline_aligned_in_smp;
+};
+
+/*
+ * struct damon_target_lookup - Cached, sorted region snapshot for one target.
+ * @regions:	Array of region pointers, sorted by ar.start (address order).
+ * @nr_regions:	Number of entries in @regions.
+ *
+ * Built once per aggregation tick by damon_build_target_lookup() so the ring
+ * drain can binary-search a target's regions instead of walking the list.
+ */
+struct damon_target_lookup {
+	struct damon_region **regions;
+	unsigned int nr_regions;
 };
 
 /**
@@ -865,6 +921,7 @@ struct damon_filter {
  */
 struct damon_probe {
 	unsigned int weight;
+	bool event_driven;	/* hits arrive via ring drain, not apply_probes */
 /* private: */
 	/* Preparation actions to apply to each probing memory. */
 	struct list_head preps;
@@ -1081,6 +1138,34 @@ struct damon_ctx {
 
 	/* @rnd_state:	Per-ctx PRNG state for damon_rand(). */
 	struct rnd_state rnd_state;
+
+	/* Reusable drain-loop snapshot buffer (avoids per-tick kmalloc). */
+	struct {
+		struct damon_target_lookup *lookups;
+		unsigned int nr_lookups;
+		struct damon_region **region_buf;
+		unsigned int region_buf_cap;
+	} drain_snapshot;
+
+	/*
+	 * Per-context perf-event report ring.  Unlike the page_fault primitive
+	 * (which has no ctx at report time and so uses a global ring), a perf
+	 * overflow handler is armed by -- and carries a pointer to -- its owning
+	 * ctx (damon_access_report.ctx), so its reports route to this per-ctx
+	 * ring.  This gives full per-context isolation (two perf-driven ctxs
+	 * never share a ring) and removes any need for a cross-ctx perf ring
+	 * owner guard.
+	 *
+	 * Allocated lazily when the first perf probe is armed
+	 * (damon_ctx_alloc_perf_ring, from damon_perf_probe_setup) and freed in
+	 * damon_destroy_ctx() AFTER all perf events are released, so no in-flight
+	 * NMI can reach freed storage.  perf_rings == NULL means "no perf ring
+	 * yet" and any perf report is dropped, so a build/config without a perf
+	 * source simply never allocates it (lazy alloc = zero cost when unused).
+	 */
+	struct damon_report_ring __percpu *perf_rings;
+	int __percpu *perf_ring_busy;
+	cpumask_t perf_pending;
 };
 
 /* Get a random number in [@l, @r) using @ctx's lockless PRNG. */
@@ -1199,6 +1284,7 @@ void damon_destroy_filter(struct damon_filter *f);
 
 struct damon_probe *damon_new_probe(void);
 void damon_add_probe(struct damon_ctx *ctx, struct damon_probe *probe);
+bool damon_has_event_driven_probes(struct damon_ctx *ctx);
 
 struct damon_region *damon_new_region(unsigned long start, unsigned long end);
 unsigned int damon_nr_accesses_mvsum(struct damon_region *r,
@@ -1288,6 +1374,7 @@ int damon_call(struct damon_ctx *ctx, struct damon_call_control *control);
 int damos_walk(struct damon_ctx *ctx, struct damos_walk_control *control);
 
 void damon_report_access(struct damon_access_report *report);
+int damon_ctx_alloc_perf_ring(struct damon_ctx *ctx);
 #ifdef CONFIG_MMU
 void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd);
 #else
@@ -1301,10 +1388,13 @@ int damon_set_region_system_rams_default(struct damon_target *t,
 				unsigned long addr_unit,
 				unsigned long min_region_sz);
 
+
+unsigned long damon_get_report_overflow(void);
+unsigned long damon_get_samples_drained(void);
+unsigned long damon_get_samples_stale_drained(void);
+unsigned long damon_get_samples_no_region(void);
 #ifdef CONFIG_ACMA
-
 unsigned long damon_alloced_bytes(void);
-
 #endif
 
 #else	/* CONFIG_DAMON */
