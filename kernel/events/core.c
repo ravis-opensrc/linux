@@ -7250,10 +7250,8 @@ void perf_event_release_aux(struct perf_event *event)
 	 * event->rb == rb check ensure only one caller performs the detach.
 	 */
 	mutex_lock(&event->mmap_mutex);
-	if (event->rb == rb) {
+	if (event->rb == rb)
 		ring_buffer_attach(event, NULL);
-		ring_buffer_put(rb); /* drop the event->rb reference */
-	}
 	mutex_unlock(&event->mmap_mutex);
 
 out_put:
