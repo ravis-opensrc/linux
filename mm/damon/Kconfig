@@ -83,6 +83,19 @@ config DAMON_PERF_AUX
 	  Each CPU's buffer is parsed on that CPU, so reports enqueue into the
 	  report ring of the CPU that produced them.
 
+config DAMON_PERF_VAUX
+	bool "virtual AUX source for DAMON"
+	depends on DAMON_PERF_AUX && DEBUG_FS
+	help
+	  Registers a software PMU that writes address records into a perf AUX
+	  buffer, together with the DAMON backend that parses them.  This
+	  exercises the AUX report path on systems that have no AUX-capable
+	  sampling hardware.
+
+	  The emitted address range, the sub-range most records fall in, and the
+	  process the addresses belong to are configured through debugfs.  Say N
+	  on production systems.
+
 config DAMON_VADDR_KUNIT_TEST
 	bool "Test for DAMON operations" if !KUNIT_ALL_TESTS
 	depends on DAMON_VADDR && KUNIT=y

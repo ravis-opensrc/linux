@@ -11,3 +11,4 @@ obj-$(CONFIG_DAMON_STAT)	+= modules-common.o stat.o
 obj-$(CONFIG_DAMON_ACMA)	+= modules-common.o acma.o
 obj-$(CONFIG_DAMON_PERF_SOURCE)	+= perf_source.o
 obj-$(CONFIG_DAMON_PERF_AUX)	+= aux_backend.o
+obj-$(CONFIG_DAMON_PERF_VAUX)	+= vaux_backend.o
