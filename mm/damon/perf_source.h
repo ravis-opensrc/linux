@@ -13,6 +13,7 @@
 #include <linux/cpumask.h>
 #include <linux/damon.h>
 #include <linux/perf_event.h>
+#include <linux/workqueue.h>
 
 #include "aux_backend.h"
 
@@ -38,6 +39,20 @@ struct damon_perf_event_attr {
 	u32 precise_ip;
 };
 
+struct damon_perf_probe_event;
+
+/*
+ * Per-CPU drain work for an AUX backend.  damon_report_access() enqueues into
+ * the report ring of the calling CPU, so a CPU's AUX buffer is parsed on that
+ * CPU via queue_work_on().
+ */
+struct damon_aux_drain_work {
+	struct work_struct work;
+	struct damon_perf_probe_event *event;
+	int cpu;
+	unsigned int nr;	/* records drained by the last run */
+};
+
 struct damon_perf_probe_event {
 	struct damon_perf_event_attr attr;
 	struct damon_ctx *ctx;	/* owning ctx for ring routing; set at setup */
@@ -46,7 +61,8 @@ struct damon_perf_probe_event {
 	int probe_idx;		/* index into probe_hits[]; set at registration */
 	/* AUX backend state; ops == NULL for overflow-handler PMUs */
 	const struct damon_perf_backend_ops *ops;
-	cpumask_t aux_cpumask;	/* CPUs with initialized AUX resources */
+	struct damon_aux_drain_work __percpu *aux_work;
+	cpumask_t aux_cpumask;	/* CPUs with initialised AUX resources */
 };
 
 int damon_perf_probe_setup(struct damon_ctx *ctx,

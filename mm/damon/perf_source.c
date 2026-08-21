@@ -536,6 +536,12 @@ void damon_perf_probe_teardown(struct damon_ctx *ctx,
 			cpuhp_state_remove_instance(damon_perf_cpuhp_state,
 						    &event->hlist_node);
 			free_percpu(perf->event);
+			/*
+			 * The offline callback above ran the backend cleanup
+			 * for every CPU, so no drain can be in flight and the
+			 * dispatch state can be released.
+			 */
+			damon_perf_aux_free(event);
 		}
 		kfree(perf);
 		event->priv = NULL;
