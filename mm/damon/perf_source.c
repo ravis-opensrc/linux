@@ -279,6 +279,28 @@ static int damon_perf_cpu_online(unsigned int cpu, struct hlist_node *node)
 		return 0;
 	}
 	per_cpu(*perf->event, cpu) = perf_event;
+
+	/*
+	 * A PMU that records into an AUX trace buffer reports through a
+	 * backend rather than the overflow handler.  Bind the backend on the
+	 * first CPU that creates an event for this probe, then give it this
+	 * CPU's resources.  This has to happen before the counter is enabled,
+	 * since such a PMU needs its buffer attached before it starts.
+	 */
+	damon_perf_aux_select(event, perf_event);
+	if (event->ops && event->ops->init) {
+		int err = event->ops->init(event, cpu, perf_event);
+
+		if (err) {
+			pr_warn_ratelimited("damon-perf: cpu %u %s init failed: %d\n",
+					    cpu, event->ops->name, err);
+			/* Never enabled, so release it directly. */
+			perf_event_release_kernel(perf_event);
+			per_cpu(*perf->event, cpu) = NULL;
+			return 0;
+		}
+	}
+
 	perf_event_enable(perf_event);
 	return 0;
 }
@@ -295,6 +317,8 @@ static int damon_perf_cpu_offline(unsigned int cpu, struct hlist_node *node)
 
 	perf_event = per_cpu(*perf->event, cpu);
 	if (perf_event) {
+		if (event->ops && event->ops->cleanup)
+			event->ops->cleanup(event, cpu);
 		perf_event_disable(perf_event);
 		perf_event_release_kernel(perf_event);
 		per_cpu(*perf->event, cpu) = NULL;

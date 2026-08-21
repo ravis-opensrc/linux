@@ -10,8 +10,11 @@
 
 #ifdef CONFIG_DAMON_PERF_SOURCE
 
+#include <linux/cpumask.h>
 #include <linux/damon.h>
 #include <linux/perf_event.h>
+
+#include "aux_backend.h"
 
 /*
  * PMU event attributes for a perf-event probe.  A subset of perf_event_attr
@@ -41,6 +44,9 @@ struct damon_perf_probe_event {
 	void *priv;		/* struct damon_perf_probe_state * */
 	struct hlist_node hlist_node;
 	int probe_idx;		/* index into probe_hits[]; set at registration */
+	/* AUX backend state; ops == NULL for overflow-handler PMUs */
+	const struct damon_perf_backend_ops *ops;
+	cpumask_t aux_cpumask;	/* CPUs with initialized AUX resources */
 };
 
 int damon_perf_probe_setup(struct damon_ctx *ctx,

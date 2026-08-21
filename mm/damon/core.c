@@ -18,6 +18,7 @@
 
 /* for damon_get_folio() used by node eligible memory metrics */
 #include "ops-common.h"
+#include "aux_backend.h"
 #include "perf_source.h"
 
 #define CREATE_TRACE_POINTS
@@ -5001,6 +5002,14 @@ static int kdamond_fn(void *data)
 
 		kdamond_usleep(sample_interval);
 		ctx->passed_sample_intervals++;
+
+		/*
+		 * A PMU that records into an AUX trace buffer produces no
+		 * per-sample interrupt, so its records are parsed into reports
+		 * here, before the ring drain below consumes them.
+		 */
+		if (damon_has_event_driven_probes(ctx))
+			damon_perf_aux_drain(ctx);
 
 		/*
 		 * Both perf-event and page-fault primitives feed damon_report_access()

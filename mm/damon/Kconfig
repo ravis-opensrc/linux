@@ -71,6 +71,18 @@ config DAMON_PERF_SOURCE
 	  each drive different PMUs concurrently, each draining its own
 	  per-context report ring.
 
+config DAMON_PERF_AUX
+	bool "AUX trace-buffer backends for DAMON perf probes"
+	depends on DAMON_PERF_SOURCE
+	help
+	  Supports PMUs that record accesses into a perf AUX trace buffer
+	  instead of delivering them through an overflow handler.  A backend
+	  claims its PMU, parses the records the PMU wrote, and feeds them into
+	  DAMON via damon_report_access().
+
+	  Each CPU's buffer is parsed on that CPU, so reports enqueue into the
+	  report ring of the CPU that produced them.
+
 config DAMON_VADDR_KUNIT_TEST
 	bool "Test for DAMON operations" if !KUNIT_ALL_TESTS
 	depends on DAMON_VADDR && KUNIT=y
