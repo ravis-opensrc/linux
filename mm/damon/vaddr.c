@@ -13,6 +13,7 @@
 #include <linux/pagemap.h>
 #include <linux/pagewalk.h>
 #include <linux/sched/mm.h>
+#include <asm/tlb.h>
 
 #include "../internal.h"
 #include "ops-common.h"
@@ -329,7 +330,8 @@ static void __damon_va_prepare_access_check(struct mm_struct *mm,
 	damon_va_mkold(mm, r->sampling_addr);
 }
 
-static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
+/* Use page table accessed bits */
+static void damon_va_prepare_access_checks_abit(struct damon_ctx *ctx)
 {
 	struct damon_target *t;
 	struct mm_struct *mm;
@@ -343,6 +345,67 @@ static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
 			__damon_va_prepare_access_check(mm, r, ctx);
 		mmput(mm);
 	}
+}
+
+/*
+ * Install the page table marker whose fault reports the access.  The target
+ * mm and the vma of the address are available here, so the marker is set on
+ * the mapping directly, without a reverse mapping walk.
+ */
+static void damon_va_change_protection(struct mm_struct *mm,
+		unsigned long addr)
+{
+	struct vm_area_struct *vma;
+	struct mmu_gather tlb;
+
+	/*
+	 * The sampling address is a random offset within the region, so round
+	 * it down to the page it falls in.  change_protection() walks whole
+	 * page table entries and expects a page aligned range.
+	 */
+	addr = ALIGN_DOWN(addr, PAGE_SIZE);
+
+	mmap_read_lock(mm);
+
+	vma = vma_lookup(mm, addr);
+	if (!vma || !vma_is_accessible(vma) || (vma->vm_flags & VM_PFNMAP))
+		goto unlock;
+
+	tlb_gather_mmu(&tlb, mm);
+	/* todo: batch or remove tlb flushing */
+	change_protection(&tlb, vma, addr, addr + PAGE_SIZE, MM_CP_DAMON);
+	tlb_finish_mmu(&tlb);
+
+unlock:
+	mmap_read_unlock(mm);
+}
+
+/* Use page faults */
+static void damon_va_prepare_access_checks_faults(struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+	struct mm_struct *mm;
+	struct damon_region *r;
+
+	damon_for_each_target(t, ctx) {
+		mm = damon_get_mm(t);
+		if (!mm)
+			continue;
+		damon_for_each_region(r, t) {
+			r->sampling_addr = damon_rand(ctx, r->ar.start,
+					r->ar.end);
+			damon_va_change_protection(mm, r->sampling_addr);
+		}
+		mmput(mm);
+	}
+}
+
+static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
+{
+	if (ctx->sample_control.primitives_enabled.page_table)
+		damon_va_prepare_access_checks_abit(ctx);
+	if (ctx->sample_control.primitives_enabled.page_fault)
+		damon_va_prepare_access_checks_faults(ctx);
 }
 
 struct damon_young_walk_private {
