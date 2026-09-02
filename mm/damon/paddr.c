@@ -91,21 +91,25 @@ static void damon_pa_change_protection(unsigned long paddr)
 		.rmap_one = damon_pa_change_protection_one,
 		.anon_lock = folio_lock_anon_vma_read,
 	};
-	bool need_lock;
 
 	if (!folio)
 		return;
 	if (!folio_mapped(folio) || !folio_raw_mapping(folio))
-		return;
+		goto put;
 
-	need_lock = !folio_test_anon(folio) || folio_test_ksm(folio);
-	if (need_lock && !folio_trylock(folio))
-		return;
+	/*
+	 * rmap_walk() requires a locked folio for every mapping type, so the
+	 * lock is taken unconditionally, as the other reverse mapping walks in
+	 * DAMON do.
+	 */
+	if (!folio_trylock(folio))
+		goto put;
 
 	rmap_walk(folio, &rwc);
 
-	if (need_lock)
-		folio_unlock(folio);
+	folio_unlock(folio);
+put:
+	folio_put(folio);
 }
 
 static void damon_pa_prepare_access_checks_faults(struct damon_ctx *ctx)
