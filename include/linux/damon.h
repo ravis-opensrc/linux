@@ -1435,6 +1435,7 @@ int damon_set_region_system_rams_default(struct damon_target *t,
 
 unsigned long damon_get_report_overflow(void);
 unsigned long damon_get_report_ring_full(void);
+unsigned long damon_get_report_ring_full_perf(void);
 unsigned long damon_get_report_busy_drop(void);
 unsigned long damon_get_samples_drained(void);
 unsigned long damon_get_samples_stale_drained(void);

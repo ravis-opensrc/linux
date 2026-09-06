@@ -77,6 +77,17 @@ unsigned long damon_get_report_ring_full(void)
 }
 EXPORT_SYMBOL_GPL(damon_get_report_ring_full);
 
+unsigned long damon_get_report_ring_full_perf(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_report_ring_full_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_report_ring_full_perf);
+
 unsigned long damon_get_report_busy_drop(void)
 {
 	unsigned long sum = 0;
@@ -5371,3 +5382,5 @@ struct damon_region *damon_search(unsigned long addr, struct pid *pid)
 subsys_initcall(damon_init);
 
 #include "tests/core-kunit.h"
+#include "tests/drain-kunit.h"
+#include "tests/perf-kunit.h"
