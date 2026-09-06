@@ -16,3 +16,7 @@ CONFIG_DAMON_SYSFS_KUNIT_TEST=y
 
 # enable DAMON_DEBUG_SANITY to catch any bug
 CONFIG_DAMON_DEBUG_SANITY=y
+
+# for global report rings (pf/perf) and per-PMU exclusivity tests
+CONFIG_PERF_EVENTS=y
+CONFIG_DAMON_PERF_SOURCE=y
