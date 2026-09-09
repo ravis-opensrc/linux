@@ -1687,16 +1687,20 @@ static inline bool zone_is_zone_device(const struct zone *zone)
 	return zone_idx(zone) == ZONE_DEVICE;
 }
 
+#ifdef CONFIG_NUMA
 static inline struct zone *device_zone(int nid)
 {
 	return &NODE_DATA(nid)->node_zones[ZONE_DEVICE];
 }
+#endif
 #else
 static inline bool zone_is_zone_device(const struct zone *zone)
 {
 	return false;
 }
+#endif
 
+#if !defined(CONFIG_ZONE_DEVICE) && !defined(CONFIG_NUMA)
 static inline struct zone *device_zone(int nid)
 {
 	return NULL;
