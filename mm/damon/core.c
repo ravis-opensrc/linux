@@ -2754,8 +2754,8 @@ int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive)
 
 	/*
 	 * Each global report ring is drained by exactly one kdamond.  Claim the
-	 * pf and perf ring owners independently; distinct ctxs may own the two
-	 * rings, but neither ring may be shared by two draining ctxs.  Remember
+	 * pf ring owner; the perf ring is per-ctx and needs no global owner.
+	 * Neither ring may be shared by two draining ctxs.  Remember
 	 * whether this batch newly set each owner so the failure paths release
 	 * only those, never another batch's still-running owner.
 	 */
@@ -5021,7 +5021,7 @@ static void __kdamond_drain_ring(struct damon_ctx *ctx,
 			 * probe_idx == 0 (DAMON_PROBE_IDX_NONE) is the
 			 * page_fault / non-probe credit path: no probe_hits[]
 			 * slot, but it still credits the region access rate.
-			 * Reject only out-of-range indices (>= DAMON_MAX_PROBES)
+			 * Reject only out-of-range indices (> DAMON_MAX_PROBES)
 			 * and, defensively, any negative value.
 			 */
 			if (pidx < 0 || pidx > DAMON_MAX_PROBES)
