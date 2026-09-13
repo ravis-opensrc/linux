@@ -220,14 +220,15 @@ static void damon_perf_overflow(struct perf_event *perf_event,
 	if (data->sample_flags & PERF_SAMPLE_PHYS_ADDR)
 		report.paddr = data->phys_addr & PAGE_MASK;
 	if (data->sample_flags & PERF_SAMPLE_ADDR)
-		report.vaddr = data->addr;
+		report.vaddr = data->addr & PAGE_MASK;
 
 	if (!report.paddr && !report.vaddr) {
 		this_cpu_inc(damon_perf_samples_filtered);
 		return;
 	}
 
-	report.is_write = !!(data->data_src.mem_op & PERF_MEM_OP_STORE);
+	if (data->sample_flags & PERF_SAMPLE_DATA_SRC)
+		report.is_write = !!(data->data_src.mem_op & PERF_MEM_OP_STORE);
 	report.tid = task_pid_vnr(current);
 	report.tgid = task_tgid_vnr(current);
 	damon_report_access(&report);
@@ -364,9 +365,6 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 	 * Multiple probes from the same ctx sharing a PMU type are allowed;
 	 * a second ctx attempting the same PMU type returns -EBUSY.
 	 *
-	 * NOTE: damon_commit_perf_probe() updates perf_event parameters
-	 * in-place and never calls damon_perf_probe_setup(), so the owner
-	 * table is never touched on the commit path.
 	 */
 	spin_lock(&damon_pmu_owner_lock);
 	list_for_each_entry(owner, &damon_pmu_owner_list, node) {
@@ -410,10 +408,11 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 	/*
 	 * Probe indices are 1-based (0 is the zero-init sentinel).
 	 * With DAMON_MAX_PROBES slots (0..DAMON_MAX_PROBES-1), valid probe
-	 * indices are 1..DAMON_MAX_PROBES-1, so the 0-based list position
-	 * must be < DAMON_MAX_PROBES-1.
+	 * probe_idx is 1-based (0 reserved); probe_hits[] is 0-based with
+	 * DAMON_MAX_PROBES slots (indices 0..DAMON_MAX_PROBES-1).  idx is the
+	 * 0-based list position, so the valid range is 0..DAMON_MAX_PROBES-1.
 	 */
-	if (idx >= DAMON_MAX_PROBES - 1) {
+	if (idx >= DAMON_MAX_PROBES) {
 		err = -ENOSPC;
 		goto release_owner;
 	}
@@ -581,27 +580,6 @@ void damon_perf_probe_teardown(struct damon_ctx *ctx,
 	kfree(event);
 }
 EXPORT_SYMBOL_GPL(damon_perf_probe_teardown);
-
-/**
- * damon_perf_probe_alloc - allocate and initialise a perf-event-backed damon_probe.
- * @weight: probe weight for probe-weighted tiering scoring.
- *
- * The caller sets perf->attr directly after allocation to select the PMU
- * and sampling parameters (e.g. AMD IBS Op, Intel PEBS).
- *
- * Returns a new probe on success, NULL on allocation failure.
- */
-struct damon_probe *damon_perf_probe_alloc(unsigned int weight)
-{
-	struct damon_probe *probe = damon_new_probe();
-
-	if (!probe)
-		return NULL;
-	probe->weight = weight;
-	probe->event_driven = true;
-	return probe;
-}
-EXPORT_SYMBOL_GPL(damon_perf_probe_alloc);
 
 static int __init damon_perf_source_init(void)
 {

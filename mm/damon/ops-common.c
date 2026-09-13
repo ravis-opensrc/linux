@@ -180,8 +180,8 @@ int damon_hot_score(struct damon_ctx *c, struct damon_region *r,
 		 */
 		freq_subscore = min_t(int,
 				mult_frac(wsum, DAMON_MAX_SUBSCORE,
-					/* +1 guards divide-by-zero: samples-per-aggr can be 0 */
-					damon_nr_samples_per_aggr(&c->attrs) + 1),
+					
+					damon_nr_samples_per_aggr(&c->attrs)),
 				DAMON_MAX_SUBSCORE);
 	} else {
 		freq_subscore = mult_frac(damon_nr_accesses_mvsum(r, c),

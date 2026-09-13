@@ -48,7 +48,6 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 			   struct damon_perf_probe_event *event);
 void damon_perf_probe_teardown(struct damon_ctx *ctx,
 			       struct damon_perf_probe_event *event);
-struct damon_probe *damon_perf_probe_alloc(unsigned int weight);
 
 #endif /* CONFIG_DAMON_PERF_SOURCE */
 #endif /* _DAMON_PERF_SOURCE_H */
