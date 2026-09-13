@@ -241,15 +241,10 @@ static bool running_exclusive_ctxs;
 /*
  * Single-consumer owner of each global report ring.  A ring is a destructive
  * SPSC channel that must be drained by exactly one kdamond.  The pf ring is
- * claimed by the (single) ctx whose page_fault primitive is enabled; the perf
- * ring by the (single) ctx that has event-driven probes.  Because the two
- * rings are independent, they have independent owners: distinct ctxs may
- * concurrently own the pf ring and the perf ring, but no ring may be shared
- * by two draining ctxs.  Accessed only under damon_lock.
+ * claimed by the (single) ctx whose page_fault primitive is enabled.
  *
- * Only the pf ring has a global owner: it is a global ring with no ctx at
- * report time.  The perf ring is per-ctx (ctx->perf_rings), so it needs no
- * cross-ctx owner -- each ctx drains exclusively its own perf ring.
+ * The perf ring is per-ctx (ctx->perf_rings), so it needs no global owner:
+ * each ctx drains exclusively its own perf ring.
  */
 static struct damon_ctx *damon_report_ring_owner_pf;
 
@@ -3096,7 +3091,7 @@ void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 {
 	struct damon_access_report access_report = {
 		.vaddr = vmf->address,
-		.size = 1,	/* todo: set appripriately */
+		.size = 1,	/* size 1: report a single access point without a page-aligned range */
 		.tid = task_pid_vnr(current),
 		.tgid = task_tgid_vnr(current),
 		.is_write = vmf->flags & FAULT_FLAG_WRITE,
@@ -5029,7 +5024,7 @@ static void __kdamond_drain_ring(struct damon_ctx *ctx,
 			 * Reject only out-of-range indices (>= DAMON_MAX_PROBES)
 			 * and, defensively, any negative value.
 			 */
-			if (pidx < 0 || pidx >= DAMON_MAX_PROBES)
+			if (pidx < 0 || pidx > DAMON_MAX_PROBES)
 				goto next;
 
 			/* Drop reports rejected by the ctx sample filters. */
@@ -5181,8 +5176,8 @@ static int kdamond_fn(void *data)
 		ctx->passed_sample_intervals++;
 
 		/*
-		 * Both perf-event and page-fault primitives feed damon_report_access()
-		 * into the global per-CPU ring; the same drain consumes both.
+		 * perf-event reports go to the per-ctx perf ring; page-fault reports
+		 * go to the global pf ring.  Both are drained here via their ring predicates.
 		 */
 		if (damon_drains_ring_perf(ctx) || damon_drains_ring_pf(ctx))
 			kdamond_check_reported_accesses(ctx);

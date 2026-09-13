@@ -6,7 +6,6 @@
 #ifndef _DAMON_H_
 #define _DAMON_H_
 
-#include <asm/local.h>
 #include <linux/math64.h>
 #include <linux/memcontrol.h>
 #include <linux/mutex.h>
@@ -77,14 +76,14 @@ struct damon_region {
 	struct damon_addr_range ar;
 	unsigned long sampling_addr;
 	unsigned int nr_accesses;
-	unsigned char probe_hits[DAMON_MAX_PROBES];
+	unsigned int  probe_hits[DAMON_MAX_PROBES];
 	unsigned int age;
 /* private: internal use only. */
 	/* List head for siblings. */
 	struct list_head list;
 	/* for age calculation. */
 	unsigned int last_nr_accesses;
-	unsigned char last_probe_hits[DAMON_MAX_PROBES];
+	unsigned int  last_probe_hits[DAMON_MAX_PROBES];
 	bool access_reported;
 };
 
