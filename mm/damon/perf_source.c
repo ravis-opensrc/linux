@@ -21,33 +21,19 @@
 #include <linux/slab.h>
 #include "perf_source.h"
 
-/* PMU event attribute for perf-event probe configuration */
-struct damon_perf_event_attr {
-	u32 type;
-	u64 config;
-	u64 config1;
-	u64 config2;
-	bool sample_phys_addr;
-	bool sample_weight_struct;
-	bool exclude_kernel;
-	bool exclude_hv;
-	bool freq;
-	u64 sample_freq;
-	u64 sample_period;
-	u32 wakeup_events;
-	u32 precise_ip;
-};
-
-struct damon_perf_probe_event {
-	struct damon_perf_event_attr attr;
-	struct damon_ctx *ctx;	/* owning ctx for ring routing; set at setup */
-	void *priv;		/* struct damon_perf_probe_state * */
-	struct hlist_node hlist_node;
-	int probe_idx;		/* 1-based index into probe_hits[]; set at setup */
-};
+/* struct damon_perf_probe_event is defined in perf_source.h. */
 
 struct damon_perf_probe_state {
-	struct perf_event * __percpu *event;
+	struct perf_event * __percpu *event;	/* per-CPU probes (PEBS/IBS) */
+	struct perf_event *single_event;	/* single-instance (system-wide PMU) */
+	/*
+	 * NMI-handler sample accounting: accepted counts samples queued via
+	 * damon_report_access(), dropped counts samples it refused (ring
+	 * full or teardown race).  atomic64 so the NMI handler can bump
+	 * them without locking.
+	 */
+	atomic64_t accepted;
+	atomic64_t dropped;
 };
 
 static void damon_perf_overflow(struct perf_event *perf_event,
@@ -61,37 +47,53 @@ static void damon_perf_overflow(struct perf_event *perf_event,
 		.cpu = smp_processor_id(),
 	};
 	struct damon_ctx *ctx;
+	struct damon_perf_probe_state *perf;
 	int probe_idx;
 
 	/*
-	 * Teardown NULLs event->ctx (with a release barrier) before releasing
-	 * the per-CPU perf events.  An NMI overflow that has already passed
-	 * the check below may still be executing; it runs to completion and
-	 * enqueues to the per-CPU ring, which outlives the event (freed after
-	 * kdamond exits), so no use-after-free occurs.  A new NMI starting
-	 * after the store sees NULL and returns immediately.  Pairs with the
-	 * smp_store_release() in damon_perf_probe_teardown().
+	 * Teardown NULLs event->ctx (with a release barrier) before
+	 * disabling/releasing the perf events.  A new NMI starting after the
+	 * store sees NULL and returns immediately.  An NMI that already
+	 * passed the ctx check takes a refcount reference (inc_not_zero);
+	 * teardown drops the "armed" reference and spins until the count
+	 * reaches zero before freeing the descriptor.  This closes the
+	 * cross-CPU race: an NMI on another CPU inside the handler cannot
+	 * have the descriptor freed under it.  The per-CPU ring the handler
+	 * enqueues to outlives the event (freed only after kdamond exits),
+	 * so the completed handler's damon_report_access() is safe.  Pairs
+	 * with the smp_store_release() in damon_perf_probe_teardown().
 	 *
-	 * Ordering note: an NMI that observes a non-NULL ctx reads
-	 * event->probe_idx within nanoseconds of the check, while teardown's
-	 * kfree() of the event follows the release store by microseconds, so
-	 * the probe_idx read cannot race the free.
+	 * probe_idx is written once at setup (before any counter is armed)
+	 * and never mutated afterwards, so the READ_ONCE here cannot observe
+	 * a torn-down value.
+	 *
+	 * The refcount_inc_not_zero() pairs with teardown's dec-and-wait:
+	 * if teardown has already dropped the armed reference, the increment
+	 * fails and we return without touching the descriptor.  Otherwise we
+	 * hold a reference for the handler's duration, so teardown cannot
+	 * free the descriptor under us (even cross-CPU via NMI).
 	 */
 	ctx = smp_load_acquire(&event->ctx);
 	if (!ctx)
 		return;
-	probe_idx = event->probe_idx;
+	if (!refcount_inc_not_zero(&event->refcount))
+		return;
+	probe_idx = READ_ONCE(event->probe_idx);
 
 	/* probe_idx 0 is the zero-init sentinel; a valid index must be >= 1 */
 	if (WARN_ONCE(probe_idx == 0,
-		      "damon-perf: overflow handler called with probe_idx=0\n"))
+		      "damon-perf: overflow handler called with probe_idx=0\n")) {
+		refcount_dec(&event->refcount);
 		return;
+	}
 
 	report.probe_idx = probe_idx;
 	report.ctx = ctx;	/* route to this ctx's per-ctx perf ring */
 
-	if (!data)
+	if (!data) {
+		refcount_dec(&event->refcount);
 		return;
+	}
 
 	/*
 	 * Populate whichever address fields the PMU provides.
@@ -104,8 +106,10 @@ static void damon_perf_overflow(struct perf_event *perf_event,
 	if (data->sample_flags & PERF_SAMPLE_ADDR)
 		report.vaddr = data->addr & PAGE_MASK;
 
-	if (!report.paddr && !report.vaddr)
+	if (!report.paddr && !report.vaddr) {
+		refcount_dec(&event->refcount);
 		return;
+	}
 
 	/*
 	 * data_src is only valid when the PMU recorded it; otherwise
@@ -120,9 +124,18 @@ static void damon_perf_overflow(struct perf_event *perf_event,
 	 * Best-effort: a false return means the sample was dropped (ring
 	 * full, teardown race, or NMI-nested producer).  Sampling is lossy
 	 * by nature; there is nothing useful the NMI handler can do about a
-	 * drop.
+	 * drop beyond counting it.  event->priv stays valid for the
+	 * handler's duration (see the lifetime note above).
 	 */
-	damon_report_access(&report);
+	perf = READ_ONCE(event->priv);
+	if (damon_report_access(&report)) {
+		if (perf)
+			atomic64_inc(&perf->accepted);
+	} else {
+		if (perf)
+			atomic64_inc(&perf->dropped);
+	}
+	refcount_dec(&event->refcount);
 }
 
 static enum cpuhp_state damon_perf_cpuhp_state;
@@ -149,6 +162,54 @@ struct damon_pmu_owner {
 
 static LIST_HEAD(damon_pmu_owner_list);
 static DEFINE_SPINLOCK(damon_pmu_owner_lock);
+
+/*
+ * Take an extra reference on the owner for (@ctx, @type).  The owner must
+ * exist (the caller holds a reference via an armed event).  Used to keep the
+ * owner alive across a teardown/setup re-arm pair so a concurrent turn-on
+ * cannot steal the PMU in between.  Returns true when the owner was found.
+ */
+static bool damon_pmu_owner_get(struct damon_ctx *ctx, u32 type)
+{
+	struct damon_pmu_owner *owner;
+	bool found = false;
+
+	spin_lock(&damon_pmu_owner_lock);
+	list_for_each_entry(owner, &damon_pmu_owner_list, node) {
+		if (owner->pmu_type == type &&
+		    atomic_long_read(&owner->owner_ctx) == (long)ctx) {
+			atomic_inc(&owner->refcount);
+			found = true;
+			break;
+		}
+	}
+	spin_unlock(&damon_pmu_owner_lock);
+	return found;
+}
+
+/*
+ * Drop a reference on the owner for (@ctx, @type), freeing it when the last
+ * reference goes away.
+ */
+static void damon_pmu_owner_put(struct damon_ctx *ctx, u32 type)
+{
+	struct damon_pmu_owner *owner, *tmp;
+
+	spin_lock(&damon_pmu_owner_lock);
+	list_for_each_entry_safe(owner, tmp, &damon_pmu_owner_list, node) {
+		if (owner->pmu_type == type &&
+		    atomic_long_read(&owner->owner_ctx) == (long)ctx) {
+			if (atomic_dec_and_test(&owner->refcount)) {
+				list_del(&owner->node);
+				spin_unlock(&damon_pmu_owner_lock);
+				kfree(owner);
+				return;
+			}
+			break;
+		}
+	}
+	spin_unlock(&damon_pmu_owner_lock);
+}
 
 static void damon_perf_event_init_attr(struct damon_perf_probe_event *event,
 				       struct perf_event_attr *attr)
@@ -333,6 +394,11 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 	}
 	event->probe_idx = idx + 1;	/* 1-based; 0 is reserved sentinel */
 	event->ctx = ctx;		/* route overflow reports to this ctx */
+	/*
+	 * The "armed" reference: the NMI handler takes a reference after
+	 * verifying ctx != NULL.  Teardown drops this and waits for zero.
+	 */
+	refcount_set(&event->refcount, 1);
 
 	/*
 	 * Allocate the ctx's per-ctx perf report ring before arming any event,
@@ -347,6 +413,63 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 	if (!perf)
 		goto release_owner;
 	event->priv = perf;
+
+	/*
+	 * A system-wide PMU is a single hardware unit rather than a per-CPU
+	 * counter, so it needs exactly one counter: the cpuhp fan-out below
+	 * would run one redundant sampler per CPU against the one device and
+	 * corrupt its shared state.  Pin that counter to a fixed online CPU
+	 * and bypass cpuhp.
+	 *
+	 * The pin must name a real CPU (>= 0) because the PMU is
+	 * perf_invalid_context, for which cpu = -1 routes to task context.
+	 * If that CPU is later offlined, perf core either migrates the event
+	 * to another CPU (scoped PMUs, via perf_pmu_migrate_context) where it
+	 * keeps sampling, or moves it to PERF_EVENT_STATE_DEAD (scope-NONE
+	 * PMUs) where it stops; in both cases the event struct is not freed
+	 * (DAMON holds a reference from creation), so perf->single_event
+	 * remains a valid pointer and teardown's disable/release below is
+	 * safe.  Sampling is best-effort, so either outcome is acceptable.
+	 */
+	if (event->attr.single_instance) {
+		struct perf_event_attr attr;
+		int cpu = cpumask_first(cpu_online_mask);
+
+		/*
+		 * Defensive: the boot CPU cannot go offline, so this should
+		 * never trigger, but a bogus CPU would corrupt the perf_event
+		 * creation below.
+		 */
+		if (WARN_ON_ONCE(cpu >= nr_cpu_ids)) {
+			err = -ENODEV;
+			goto release_owner;
+		}
+
+		damon_perf_event_init_attr(event, &attr);
+		/*
+		 * Pass @event (not a probe_idx cookie) as the overflow
+		 * context: damon_perf_overflow() reads event->ctx via
+		 * smp_load_acquire() for the teardown race barrier, same as
+		 * the per-CPU path (damon_perf_cpu_online()).
+		 */
+		perf->single_event = perf_event_create_kernel_counter(&attr,
+				cpu, NULL, damon_perf_overflow, event);
+		if (IS_ERR(perf->single_event)) {
+			err = PTR_ERR(perf->single_event);
+			perf->single_event = NULL;
+			pr_warn("damon-perf: single-instance event create failed: %d\n",
+				err);
+			goto free_perf;
+		}
+		perf_event_enable(perf->single_event);
+		/*
+		 * Ownership is already held via the per-PMU owner->refcount
+		 * acquired at the top of setup; the single-instance path shares
+		 * that slot, so no separate refcount is taken here.  Teardown
+		 * releases it through the same owner list as the per-CPU path.
+		 */
+		return 0;
+	}
 
 	perf->event = alloc_percpu(typeof(*perf->event));
 	if (!perf->event)
@@ -392,10 +515,15 @@ void damon_perf_probe_teardown(struct damon_ctx *ctx,
 			       struct damon_perf_probe_event *event)
 {
 	struct damon_perf_probe_state *perf = event->priv;
-	struct damon_pmu_owner *owner, *tmp;
 
-	if (!perf)
+	/*
+	 * The event was never armed (e.g. a param_ctx descriptor discarded
+	 * after a failed commit): just free the descriptor.
+	 */
+	if (!perf) {
+		kfree(event);
 		return;
+	}
 
 	/*
 	 * Signal in-flight NMI overflow handlers to drop samples before
@@ -407,40 +535,88 @@ void damon_perf_probe_teardown(struct damon_ctx *ctx,
 	/*
 	 * cpuhp_state_remove_instance() disables and releases each CPU's perf
 	 * event; once it returns, no new overflow can be delivered for this
-	 * event.
+	 * event.  The single-instance path bypassed cpuhp, so release its one
+	 * counter directly; the event struct stays valid even if its pinned
+	 * CPU went offline (see the setup comment).
 	 */
-	cpuhp_state_remove_instance(damon_perf_cpuhp_state,
-				    &event->hlist_node);
-	free_percpu(perf->event);
+	if (perf->single_event) {
+		perf_event_disable(perf->single_event);
+		perf_event_release_kernel(perf->single_event);
+	} else {
+		cpuhp_state_remove_instance(damon_perf_cpuhp_state,
+					    &event->hlist_node);
+		free_percpu(perf->event);
+	}
 	kfree(perf);
 	event->priv = NULL;
 
 	/*
-	 * Release per-PMU ownership when the last probe for this
-	 * ctx/PMU-type pair is torn down.
+	 * Drop the "armed" reference and wait for in-flight NMI handlers.
+	 * A handler that passed the ctx check before we NULLed it holds a
+	 * reference; we spin (not sleep — teardown can run in atomic
+	 * context) until all such handlers complete.  New handlers cannot
+	 * start: ctx is NULL and the perf events are disabled.
 	 */
-	spin_lock(&damon_pmu_owner_lock);
-	list_for_each_entry_safe(owner, tmp, &damon_pmu_owner_list, node) {
-		if (owner->pmu_type == event->attr.type &&
-		    atomic_long_read(&owner->owner_ctx) == (long)ctx) {
-			/*
-			 * Free under the lock so a concurrent same-PMU teardown
-			 * cannot observe and free the same owner. kfree() under
-			 * a non-irq spinlock in process context is safe.
-			 */
-			if (atomic_dec_and_test(&owner->refcount)) {
-				list_del(&owner->node);
-				kfree(owner);
-			}
-			break;
-		}
-	}
-	spin_unlock(&damon_pmu_owner_lock);
+	refcount_dec(&event->refcount);
+	while (refcount_read(&event->refcount) != 0)
+		cpu_relax();
+
+	/* Release per-PMU ownership when the last probe for this
+	 * ctx/PMU-type pair is torn down.  kfree() under a non-irq spinlock
+	 * in process context is safe.
+	 */
+	damon_pmu_owner_put(ctx, event->attr.type);
 
 	/* teardown owns the event allocation */
 	kfree(event);
 }
 EXPORT_SYMBOL_GPL(damon_perf_probe_teardown);
+
+/**
+ * damon_perf_probe_rearm - replace an armed perf event with a new one.
+ * @ctx:   DAMON context that owns the probe.
+ * @probe: the damon_probe being re-armed.
+ * @old:   the currently armed descriptor (freed).
+ * @new:   the new descriptor; on success ownership moves to the probe,
+ *         on failure the caller retains it.
+ *
+ * The probe keeps its ctx->probes list position across the swap, so setup()
+ * assigns @new the same probe_idx slot @old used; the NMI handler's
+ * probe_hits[] indexing is undisturbed.
+ *
+ * Returns 0 on success, negative errno on failure.  On failure nothing is
+ * left armed: the caller should clear the probe's event_driven flag.
+ */
+int damon_perf_probe_rearm(struct damon_ctx *ctx, struct damon_probe *probe,
+			   struct damon_perf_probe_event *old,
+			   struct damon_perf_probe_event *new)
+{
+	int err;
+	bool owner_held;
+
+	if (new->attr.type == old->attr.type) {
+		/*
+		 * Same PMU: hold an extra owner reference across the
+		 * teardown/setup pair so the PMU claim never drops to zero
+		 * and a concurrent turn-on cannot steal it in between.
+		 */
+		owner_held = damon_pmu_owner_get(ctx, old->attr.type);
+		damon_perf_probe_teardown(ctx, old);
+		err = damon_perf_probe_setup(ctx, probe, new);
+		if (owner_held)
+			damon_pmu_owner_put(ctx, old->attr.type);
+	} else {
+		/*
+		 * Different PMU: there is no ownership to preserve across
+		 * the swap, so release the old claim before acquiring the
+		 * new one.
+		 */
+		damon_perf_probe_teardown(ctx, old);
+		err = damon_perf_probe_setup(ctx, probe, new);
+	}
+	return err;
+}
+EXPORT_SYMBOL_GPL(damon_perf_probe_rearm);
 
 static int __init damon_perf_source_init(void)
 {
