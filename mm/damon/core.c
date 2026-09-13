@@ -612,7 +612,7 @@ unsigned int damon_nr_accesses_mvsum(struct damon_region *r,
 			left_window_bp);
 }
 
-unsigned char damon_probe_hits_mvsum(int probe_idx, struct damon_region *r,
+unsigned int damon_probe_hits_mvsum(int probe_idx, struct damon_region *r,
 		struct damon_ctx *ctx)
 {
 	unsigned long sample_interval, aggr_interval;
