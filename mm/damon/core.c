@@ -2514,7 +2514,6 @@ void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 	struct damon_access_report access_report = {
 		.vaddr = vmf->address,
 		.size = 1,	/* todo: set appripriately */
-		.cpu = smp_processor_id(),
 		.tid = task_pid_vnr(current),
 		.is_write = vmf->flags & FAULT_FLAG_WRITE,
 	};
@@ -2524,7 +2523,14 @@ void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 	else
 		access_report.paddr = PFN_PHYS(pte_pfn(vmf->orig_pte));
 
+	/*
+	 * This runs in fault context, which is preemptible, so read the CPU
+	 * number with preemption disabled.  Keep it disabled across the
+	 * report so the recorded CPU is the one the fault was handled on.
+	 */
+	access_report.cpu = get_cpu();
 	damon_report_access(&access_report);
+	put_cpu();
 }
 #endif
 
