@@ -2393,6 +2393,10 @@ static int damon_sysfs_set_preps(struct damon_probe *probe,
 		if (sys_prep->action == DAMON_PREP_PERF_EVENT &&
 		    sys_prep->sample_period && sys_prep->sample_freq)
 			return -EINVAL;
+		/* precise_ip is a 2-bit bitfield in perf_event_attr */
+		if (sys_prep->action == DAMON_PREP_PERF_EVENT &&
+		    sys_prep->precise_ip > 3)
+			return -EINVAL;
 
 		prep = damon_new_prep(sys_prep->action);
 		if (!prep)

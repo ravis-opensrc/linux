@@ -183,16 +183,19 @@ static void damon_perf_overflow(struct perf_event *perf_event,
 	int probe_idx;
 	struct damon_ctx *ctx;
 	struct damon_access_report report = {
-		.size = PAGE_SIZE,
+		.size = PAGE_SIZE,	/* one sample reports one access point */
 		.cpu = smp_processor_id(),
 	};
 
 	/*
 	 * Teardown NULLs event->ctx (with a release barrier) before releasing
-	 * the per-CPU perf events, so an in-flight overflow racing the
-	 * disable/release observes the torn-down state and drops the sample
-	 * instead of reporting into a freed ctx.  Pairs with the
-	 * smp_store_release(&event->ctx, NULL) in damon_perf_probe_teardown().
+	 * the per-CPU perf events.  An NMI overflow that has already passed
+	 * the smp_load_acquire(&event->ctx) check in the handler may still be
+	 * executing; it will enqueue to the per-CPU ring and return normally.
+	 * The ring is freed later (after kdamond exit), so no use-after-free
+	 * occurs on the ring.  A new NMI that starts after the store sees ctx
+	 * == NULL and returns immediately.  Pairs with smp_load_acquire in the
+	 * handler (damon_perf_overflow()).
 	 */
 	ctx = smp_load_acquire(&event->ctx);
 	if (!ctx)
@@ -313,7 +316,7 @@ static int damon_perf_cpu_online(unsigned int cpu, struct hlist_node *node)
 	if (IS_ERR(perf_event)) {
 		pr_warn_ratelimited("damon-perf: cpu %u event create failed: %ld\n",
 				    cpu, PTR_ERR(perf_event));
-		return 0;
+		return PTR_ERR(perf_event);
 	}
 	per_cpu(*perf->event, cpu) = perf_event;
 
@@ -442,9 +445,11 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 	 *
 	 * The pin must name a real CPU (>= 0) because the PMU is
 	 * perf_invalid_context, for which cpu = -1 routes to task context.  If
-	 * that CPU is later offlined the counter stops and is not migrated,
-	 * which is acceptable for a dedicated monitoring host that does not
-	 * hotplug CPUs.
+	 * that CPU is later offlined, perf moves the event to
+	 * PERF_EVENT_STATE_DEAD but does not free the struct (the kernel holds
+	 * a refcount), so perf->single_event is still a valid pointer.  The
+	 * counter simply stops delivering samples; this is acceptable for a
+	 * dedicated monitoring host that does not hotplug CPUs.
 	 */
 	if (event->attr.single_instance) {
 		struct perf_event_attr attr;
