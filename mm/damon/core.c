@@ -277,7 +277,7 @@ static struct damon_probe *damon_nth_probe(int n, struct damon_ctx *ctx)
 	return NULL;
 }
 
-static bool damon_has_probe_weights(struct damon_ctx *c)
+bool damon_has_probe_weights(struct damon_ctx *c)
 {
 	struct damon_probe *p;
 
@@ -2551,15 +2551,10 @@ void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 	struct damon_access_report access_report = {
 		.vaddr = vmf->address,
 		.size = 1,	/* todo: set appripriately */
+		.cpu = smp_processor_id(),
 		.tid = task_pid_vnr(current),
 		.is_write = vmf->flags & FAULT_FLAG_WRITE,
 	};
-
-	/*
-	 * Fault context is preemptible; read the CPU number with preemption
-	 * disabled so the recorded CPU is the one handling the fault.
-	 */
-	access_report.cpu = get_cpu();
 
 	if (huge_pmd)
 		access_report.paddr = PFN_PHYS(pmd_pfn(vmf->orig_pmd));
@@ -2567,7 +2562,6 @@ void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 		access_report.paddr = PFN_PHYS(pte_pfn(vmf->orig_pte));
 
 	damon_report_access(&access_report);
-	put_cpu();
 }
 #endif
 
@@ -3467,20 +3461,6 @@ static void damos_set_quota_goal_current_value(struct damon_ctx *c,
 	case DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP:
 		goal->current_value = damos_get_node_eligible_mem_bp(c, s,
 				goal->nid);
-		if (trace_damos_node_eligible_mem_bp_enabled()) {
-			unsigned int cidx = 0, sidx = 0;
-			struct damos *siter;
-
-			damon_for_each_scheme(siter, c) {
-				if (siter == s)
-					break;
-				sidx++;
-			}
-			trace_damos_node_eligible_mem_bp(cidx, sidx,
-					goal->nid,
-					goal->target_value,
-					goal->current_value);
-		}
 		break;
 	case DAMOS_QUOTA_HUGEPAGE_MEM_BP:
 		goal->current_value = damos_hugepage_mem_bp();
