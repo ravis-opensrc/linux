@@ -2551,10 +2551,15 @@ void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 	struct damon_access_report access_report = {
 		.vaddr = vmf->address,
 		.size = 1,	/* todo: set appripriately */
-		.cpu = smp_processor_id(),
 		.tid = task_pid_vnr(current),
 		.is_write = vmf->flags & FAULT_FLAG_WRITE,
 	};
+
+	/*
+	 * Fault context is preemptible; read the CPU number with preemption
+	 * disabled so the recorded CPU is the one handling the fault.
+	 */
+	access_report.cpu = get_cpu();
 
 	if (huge_pmd)
 		access_report.paddr = PFN_PHYS(pmd_pfn(vmf->orig_pmd));
@@ -2562,6 +2567,7 @@ void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 		access_report.paddr = PFN_PHYS(pte_pfn(vmf->orig_pte));
 
 	damon_report_access(&access_report);
+	put_cpu();
 }
 #endif
 
