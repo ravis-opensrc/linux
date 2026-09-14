@@ -266,6 +266,16 @@ static unsigned int damon_pa_apply_probes(struct damon_ctx *ctx,
 			pa = damon_pa_phys_addr(r->sampling_addr,
 					ctx->addr_unit);
 			folio = damon_get_folio(PHYS_PFN(pa));
+			/*
+			 * Credit probe_hits[] for every probe whose filter
+			 * passes.  For event-driven probes (weight > 0) the
+			 * ring drain also credits probe_hits[], so hardware
+			 * probes accumulate from two sources; this is correct
+			 * and intentional -- the software-visible folio filter
+			 * is the ops-level access check, while the ring drain
+			 * is the NMI-context PMU sample.  Both contribute to
+			 * the same probe_hits[] slot and the wsum normalises.
+			 */
 			damon_for_each_probe(p, ctx) {
 				if (damon_pa_filter_pass(folio, p))
 					r->probe_hits[i]++;

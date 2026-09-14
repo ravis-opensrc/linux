@@ -18,12 +18,106 @@
 
 /* for damon_get_folio() used by node eligible memory metrics */
 #include "ops-common.h"
+#include "perf_source.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/damon.h>
 
-#define DAMON_ACCESS_REPORTS_CAP 1000
+/*
+ * Report rings are partitioned by the globally-meaningful probe_idx boundary,
+ * and the two classes live in different places:
+ *
+ *   page-fault reports (probe_idx == DAMON_PROBE_IDX_NONE, 0): a GLOBAL per-CPU
+ *     PA-only: no page-fault ring.  Only the per-context perf ring is used.
+ *     at report time, so a per-context ring is not expressible; the global ring
+ *     is drained by the single context whose page_fault primitive is enabled
 
+ *   perf-event reports (probe_idx >= 1): a PER-CONTEXT per-CPU ring
+ *     (ctx->perf_rings).  The overflow handler carries the owning ctx, so each
+ *     perf-driven context drains only its own ring -- no global ring and no
+ *     cross-context owner needed.  See struct damon_ctx.
+ *
+ * Each context's per-CPU ring has its OWN per-CPU storage, busy flag, pending
+ * cpumask, and overflow counter.
+ */
+/*
+ * Report drops are counted per reason.  A ring-full drop means the consumer
+ * did not keep up with the producer; a busy-guard drop means an NMI nested on
+ * top of a same-CPU producer.
+ */
+static DEFINE_PER_CPU(unsigned long, damon_report_ring_full_perf);
+static DEFINE_PER_CPU(unsigned long, damon_report_busy_drop_perf);
+static DEFINE_PER_CPU(unsigned long, damon_samples_drained);
+static DEFINE_PER_CPU(unsigned long, damon_samples_stale_drained);
+static DEFINE_PER_CPU(unsigned long, damon_samples_no_region);
+
+/*
+ * Producer (NMI) sets after publishing a report; consumer (kdamond) clears
+ * before draining the corresponding ring.  Hot-write under sampling load -
+ * do NOT mark __read_mostly.  One pending mask per ring.
+ */
+
+unsigned long damon_get_report_ring_full(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_report_ring_full_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_report_ring_full);
+
+unsigned long damon_get_report_busy_drop(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_report_busy_drop_perf, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_report_busy_drop);
+
+/* Reports dropped for either reason.  Kept so existing users need no change. */
+unsigned long damon_get_report_overflow(void)
+{
+	return damon_get_report_ring_full() + damon_get_report_busy_drop();
+}
+EXPORT_SYMBOL_GPL(damon_get_report_overflow);
+
+unsigned long damon_get_samples_drained(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_samples_drained, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_drained);
+
+unsigned long damon_get_samples_stale_drained(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_samples_stale_drained, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_stale_drained);
+
+unsigned long damon_get_samples_no_region(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_samples_no_region, cpu);
+	return sum;
+}
+EXPORT_SYMBOL_GPL(damon_get_samples_no_region);
 static DEFINE_MUTEX(damon_lock);
 static int nr_running_ctxs;
 static bool running_exclusive_ctxs;
@@ -32,11 +126,6 @@ static DEFINE_MUTEX(damon_ops_lock);
 static struct damon_operations damon_registered_ops[NR_DAMON_OPS];
 
 static struct kmem_cache *damon_region_cache __ro_after_init;
-
-static DEFINE_MUTEX(damon_access_reports_lock);
-static struct damon_access_report damon_access_reports[
-	DAMON_ACCESS_REPORTS_CAP];
-static int damon_access_reports_len;
 
 /* Should be called under damon_ops_lock with id smaller than NR_DAMON_OPS */
 static bool __damon_is_registered_ops(enum damon_ops_id id)
@@ -231,6 +320,16 @@ struct damon_probe *damon_new_probe(void)
 	if (!p)
 		return NULL;
 	p->weight = 0;
+	p->event_driven = false;
+	/*
+	 * Must be NULL: damon_destroy_ctx()/damon_commit_probes() test
+	 * p->perf_priv to decide whether to call damon_perf_probe_teardown().
+	 * An uninitialised (garbage) perf_priv makes the teardown kfree() a
+	 * wild pointer when a probe is destroyed before it is ever armed
+	 * (e.g. perf_event_create_kernel_counter() fails and damon_start()
+	 * unwinds via damon_destroy_ctx()).
+	 */
+	p->perf_priv = NULL;
 	INIT_LIST_HEAD(&p->preps);
 	INIT_LIST_HEAD(&p->filters);
 	INIT_LIST_HEAD(&p->list);
@@ -286,6 +385,34 @@ bool damon_has_probe_weights(struct damon_ctx *c)
 			return true;
 	}
 	return false;
+}
+
+/**
+ * damon_has_event_driven_probes() - return true if @ctx has any event-driven
+ * probes registered.
+ *
+ * Event-driven probes (e.g. perf-event IBS/PEBS) populate probe_hits[] via
+ * the SPSC ring drain rather than the apply_probes vtable.  Callers use this
+ * to decide whether to arm hardware sampling.
+ *
+ * @ctx: the DAMON context whose probes are inspected.
+ */
+bool damon_has_event_driven_probes(struct damon_ctx *ctx)
+{
+	struct damon_probe *p;
+
+	damon_for_each_probe(p, ctx) {
+		if (p->event_driven)
+			return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL_GPL(damon_has_event_driven_probes);
+
+/* Does @ctx drive (and thus need exclusive drain of) the perf report ring? */
+static bool damon_drains_ring_perf(struct damon_ctx *ctx)
+{
+	return damon_has_event_driven_probes(ctx);
 }
 
 /*
@@ -353,7 +480,7 @@ unsigned int damon_nr_accesses_mvsum(struct damon_region *r,
 			left_window_bp);
 }
 
-unsigned char damon_probe_hits_mvsum(int probe_idx, struct damon_region *r,
+unsigned int damon_probe_hits_mvsum(int probe_idx, struct damon_region *r,
 		struct damon_ctx *ctx)
 {
 	unsigned long sample_interval, aggr_interval;
@@ -973,13 +1100,6 @@ static struct damon_sample_filter *damon_nth_sample_filter(int n,
 	return NULL;
 }
 
-static struct damon_sample_filter *damon_last_sample_filter_or_null(
-		struct damon_sample_control *ctrl)
-{
-	return list_last_entry_or_null(&ctrl->sample_filters,
-			struct damon_sample_filter, list);
-}
-
 struct damon_ctx *damon_new_ctx(void)
 {
 	struct damon_ctx *ctx;
@@ -1024,6 +1144,40 @@ struct damon_ctx *damon_new_ctx(void)
 	return ctx;
 }
 
+/*
+ * Lazily allocate the per-ctx perf report ring.  Called from the perf probe
+ * setup path BEFORE any perf event is armed, so an overflow can never observe
+ * a half-built ring.  Idempotent: a ctx with several perf probes allocates
+ * once.  The ring is freed in damon_destroy_ctx() after all perf events are
+ * released (damon_perf_probe_teardown), so no in-flight NMI can reach it.
+ */
+int damon_ctx_alloc_perf_ring(struct damon_ctx *ctx)
+{
+	if (ctx->perf_rings)
+		return 0;	/* already allocated for an earlier probe */
+	ctx->perf_rings = alloc_percpu(struct damon_report_ring);
+	if (!ctx->perf_rings)
+		return -ENOMEM;
+	ctx->perf_ring_busy = alloc_percpu(int);
+	if (!ctx->perf_ring_busy) {
+		free_percpu(ctx->perf_rings);
+		ctx->perf_rings = NULL;
+		return -ENOMEM;
+	}
+	cpumask_clear(&ctx->perf_pending);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(damon_ctx_alloc_perf_ring);
+
+/* Free the per-ctx perf ring.  Caller must ensure no perf event is armed. */
+static void damon_ctx_free_perf_ring(struct damon_ctx *ctx)
+{
+	free_percpu(ctx->perf_rings);
+	ctx->perf_rings = NULL;
+	free_percpu(ctx->perf_ring_busy);
+	ctx->perf_ring_busy = NULL;
+}
+
 static void damon_destroy_targets(struct damon_ctx *ctx)
 {
 	struct damon_target *t, *next_t;
@@ -1043,12 +1197,34 @@ void damon_destroy_ctx(struct damon_ctx *ctx)
 	damon_for_each_scheme_safe(s, next_s, ctx)
 		damon_destroy_scheme(s);
 
-	damon_for_each_probe_safe(p, next_p, ctx)
+	damon_for_each_probe_safe(p, next_p, ctx) {
+#ifdef CONFIG_DAMON_PERF_SOURCE
+		/*
+		 * Release the PMU counters before freeing the probe.
+		 * damon_perf_probe_teardown() owns and frees the event
+		 * descriptor.
+		 */
+		if (p->perf_priv) {
+			damon_perf_probe_teardown(ctx, p->perf_priv);
+			p->perf_priv = NULL;
+		}
+#endif
 		damon_destroy_probe(p);
+	}
 
 	damon_for_each_sample_filter_safe(f, next_f, &ctx->sample_control)
 		damon_destroy_sample_filter(f, &ctx->sample_control);
 
+	/*
+	 * All perf events were released by damon_perf_probe_teardown() in the
+	 * probe loop above, so no overflow handler can still reach the ring.
+	 * Safe to free now, before kfree(ctx).  No-op if never allocated.
+	 */
+	damon_ctx_free_perf_ring(ctx);
+
+	/* Free the reusable ring-drain region snapshot buffers. */
+	kfree(ctx->drain_snapshot.lookups);
+	kfree(ctx->drain_snapshot.region_buf);
 	kfree(ctx);
 }
 
@@ -1876,6 +2052,7 @@ out:
 static void damon_commit_prep(struct damon_prep *dst, struct damon_prep *src)
 {
 	dst->action = src->action;
+	dst->perf = src->perf;
 }
 
 static int damon_commit_preps(struct damon_probe *dst, struct damon_probe *src)
@@ -1968,7 +2145,83 @@ static int damon_commit_filters(struct damon_probe *dst,
 	return 0;
 }
 
-static int damon_commit_probes(struct damon_ctx *dst, struct damon_ctx *src)
+#ifdef CONFIG_DAMON_PERF_SOURCE
+/*
+ * Hand off the armed perf event between a running probe (@dst, in the live
+ * @ctx) and the committed source probe (@src, from a discarded param_ctx that
+ * was built without arming).  Keeps the running event untouched when the perf
+ * attributes are unchanged (the common weight-only commit); otherwise tears
+ * down the old event and re-arms from @src's carried attributes.
+ *
+ * @src->perf_priv is built by the sysfs layer from @src's DAMON_PREP_PERF_EVENT
+ * prep before the commit; ownership of that descriptor moves to @dst here.
+ */
+static int damon_commit_perf_probe(struct damon_ctx *ctx,
+		struct damon_probe *dst, struct damon_probe *src)
+{
+	struct damon_perf_probe_event *dst_ev = dst->perf_priv;
+	struct damon_perf_probe_event *src_ev = src->perf_priv;
+	int err;
+
+	if (!src_ev) {
+		/* Source has no perf probe: tear down any running event. */
+		if (dst_ev) {
+			damon_perf_probe_teardown(ctx, dst_ev);
+			dst->perf_priv = NULL;
+		}
+		return 0;
+	}
+
+	/* Already armed with identical attrs: keep the running event. */
+	if (dst_ev && dst_ev->priv &&
+	    !memcmp(&dst_ev->attr, &src_ev->attr, sizeof(dst_ev->attr)))
+		return 0;
+
+	/*
+	 * Attrs changed (or dst not armed): re-arm from src attributes.
+	 * The probe keeps its ctx->probes list position, so setup() assigns
+	 * the replacement event the same probe_idx slot; the NMI handler's
+	 * probe_hits[] indexing is undisturbed across the swap.
+	 */
+	if (dst_ev) {
+		err = damon_perf_probe_rearm(ctx, dst, dst_ev, src_ev);
+		if (err < 0) {
+			/* Re-arm failed and restoration failed: nothing armed. */
+			dst->event_driven = false;
+			dst->perf_priv = NULL;
+			return err;
+		}
+		if (err == 1) {
+			/*
+			 * New event failed but old was restored: the probe
+			 * already has the restored descriptor attached.  The
+			 * requested attributes were not installed; return
+			 * -EAGAIN so the caller (and sysfs) surfaces the
+			 * partial failure instead of silently reporting success.
+			 */
+			return -EAGAIN;
+		}
+	} else {
+		err = damon_perf_probe_setup(ctx, dst, src_ev);
+		if (err) {
+			dst->event_driven = false;
+			return err;
+		}
+	}
+	/* Ownership of src_ev moves to dst; the param_ctx must not free it. */
+	dst->perf_priv = src_ev;
+	src->perf_priv = NULL;
+	return 0;
+}
+#endif /* CONFIG_DAMON_PERF_SOURCE */
+
+/*
+ * @commit_live is false for the dry-run validation pass (a commit into a
+ * throwaway test_ctx) and true for the real commit into the running ctx.
+ * The PMU may only be armed or disarmed on the real commit.
+ */
+static int damon_commit_probes(struct damon_ctx *dst, struct damon_ctx *src,
+		bool commit_live)
 {
 	struct damon_probe *dst_probe, *next, *src_probe, *new_probe;
 	int i = 0, j = 0, err;
@@ -1976,7 +2229,22 @@ static int damon_commit_probes(struct damon_ctx *dst, struct damon_ctx *src)
 	damon_for_each_probe_safe(dst_probe, next, dst) {
 		src_probe = damon_nth_probe(i++, src);
 		if (src_probe) {
+#ifdef CONFIG_DAMON_PERF_SOURCE
+			/*
+			 * Re-arm the perf event first, before committing
+			 * weight/preps/filters.  If the re-arm fails the live
+			 * probe is left completely untouched (no partial
+			 * mutation); the caller reports the error.
+			 */
+			if (commit_live) {
+				err = damon_commit_perf_probe(dst, dst_probe,
+							      src_probe);
+				if (err)
+					return err;
+			}
+#endif
 			dst_probe->weight = src_probe->weight;
+			dst_probe->event_driven = src_probe->event_driven;
 			err = damon_commit_preps(dst_probe, src_probe);
 			if (err)
 				return err;
@@ -1984,6 +2252,13 @@ static int damon_commit_probes(struct damon_ctx *dst, struct damon_ctx *src)
 			if (err)
 				return err;
 		} else {
+#ifdef CONFIG_DAMON_PERF_SOURCE
+			if (commit_live && dst_probe->perf_priv) {
+				damon_perf_probe_teardown(dst,
+						dst_probe->perf_priv);
+				dst_probe->perf_priv = NULL;
+			}
+#endif
 			damon_destroy_probe(dst_probe);
 		}
 	}
@@ -1997,13 +2272,54 @@ static int damon_commit_probes(struct damon_ctx *dst, struct damon_ctx *src)
 			return -ENOMEM;
 		damon_add_probe(dst, new_probe);
 		new_probe->weight = src_probe->weight;
+		new_probe->event_driven = src_probe->event_driven;
 		err = damon_commit_preps(new_probe, src_probe);
 		if (err)
-			return err;
+			goto destroy_new_probe;
 		err = damon_commit_filters(new_probe, src_probe);
 		if (err)
-			return err;
+			goto destroy_new_probe;
+#ifdef CONFIG_DAMON_PERF_SOURCE
+		if (commit_live && src_probe->perf_priv) {
+			err = damon_perf_probe_setup(dst, new_probe,
+						     src_probe->perf_priv);
+			if (err)
+				goto destroy_new_probe;
+			new_probe->perf_priv = src_probe->perf_priv;
+			src_probe->perf_priv = NULL;
+		}
+#endif
+		continue;
+destroy_new_probe:
+		/*
+		 * The probe was linked into the live ctx before the failure;
+		 * unlink and destroy it so the live ctx is not left with a
+		 * partially-initialized probe.
+		 */
+		damon_destroy_probe(new_probe);
+		return err;
 	}
+#ifdef CONFIG_DAMON_PERF_SOURCE
+	/*
+	 * Re-index surviving perf events after list mutations.  Probe
+	 * removal shifts the list positions of later probes, but their
+	 * armed events retain the old probe_idx.  Update each event's
+	 * probe_idx to match its new list position so the NMI handler's
+	 * probe_hits[] indexing stays correct.  The handler reads
+	 * probe_idx with READ_ONCE; a 4-byte aligned store is atomic.
+	 */
+	if (commit_live) {
+		int idx = 0;
+
+		damon_for_each_probe(dst_probe, dst) {
+			struct damon_perf_probe_event *ev = dst_probe->perf_priv;
+
+			if (ev)
+				WRITE_ONCE(ev->probe_idx, idx + 1);
+			idx++;
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -2098,7 +2414,8 @@ static int damon_commit_sample_control(
 	return damon_commit_sample_filters(dst, src);
 }
 
-static int __damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
+static int __damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src,
+		bool commit_live)
 {
 	int err;
 	struct damos *scheme;
@@ -2146,13 +2463,28 @@ static int __damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
 	}
 	dst->pause = src->pause;
 	dst->ops = src->ops;
-	err = damon_commit_probes(dst, src);
+	err = damon_commit_probes(dst, src, commit_live);
 	if (err)
 		return err;
 	err = damon_commit_sample_control(&dst->sample_control,
 			&src->sample_control);
 	if (err)
 		return err;
+
+	/*
+	 * A running ctx that (still) drives a global report ring must hold sole
+	 * ownership of it; enforce it here since damon_start()'s claim only
+	 * covers the not-running -> running transition.  This runs only for the
+	 * live commit (commit_live) into the running dst; dst's probes and
+	 * sample_control were already committed above, so damon_drains_ring_*()
+	 * reflect the post-commit config.  A not-running dst claims ownership
+	 * later, in damon_start().  Each ring is claimed/released independently.
+	 */
+	/*
+	 * PA-only: no global ring ownership to manage.  The perf ring is
+	 * per-ctx, so a live commit never contends a shared ring.
+	 */
+
 	dst->addr_unit = src->addr_unit;
 	dst->min_region_sz = src->min_region_sz;
 
@@ -2168,7 +2500,7 @@ static struct damon_ctx *damon_new_test_ctx(struct damon_ctx *dst)
 	test_ctx = damon_new_ctx();
 	if (!test_ctx)
 		return NULL;
-	err = __damon_commit_ctx(test_ctx, dst);
+	err = __damon_commit_ctx(test_ctx, dst, false);
 	if (err) {
 		damon_destroy_ctx(test_ctx);
 		return NULL;
@@ -2197,10 +2529,10 @@ int damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
 	test_ctx = damon_new_test_ctx(dst);
 	if (!test_ctx)
 		return -ENOMEM;
-	err = __damon_commit_ctx(test_ctx, src);
+	err = __damon_commit_ctx(test_ctx, src, false);
 	if (err)
 		goto out;
-	err = __damon_commit_ctx(dst, src);
+	err = __damon_commit_ctx(dst, src, true);
 out:
 	damon_destroy_ctx(test_ctx);
 	return err;
@@ -2321,7 +2653,7 @@ int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive)
 		if (!test_ctx)
 			return -ENOMEM;
 
-		err = __damon_commit_ctx(test_ctx, ctxs[i]);
+		err = __damon_commit_ctx(test_ctx, ctxs[i], false);
 		damon_destroy_ctx(test_ctx);
 		if (err)
 			return err;
@@ -2334,6 +2666,10 @@ int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive)
 		return -EBUSY;
 	}
 
+	/*
+	 * PA-only: the perf ring is per-ctx and needs no global owner.
+	 * Start each context directly.
+	 */
 	for (i = 0; i < nr_ctxs; i++) {
 		err = __damon_start(ctxs[i]);
 		if (err)
@@ -2520,50 +2856,112 @@ int damos_walk(struct damon_ctx *ctx, struct damos_walk_control *control)
  * damon_report_access() - Report identified access events to DAMON.
  * @report:	The reporting access information.
  *
- * Report access events to DAMON.
+ * Report access events to DAMON via a per-CPU SPSC lockless ring.  Producer
+ * is the local CPU (typically NMI from a hardware-sampling backend);
+ * consumer is the kdamond drain in kdamond_check_reported_accesses().
  *
- * Context: May sleep.
+ * The destination ring is selected by this_cpu_ptr(), i.e. by the CPU calling
+ * this function, not by @report->cpu, which is sample metadata used by the
+ * drain-side filter.  The two coincide for a sample delivered by an interrupt
+ * on the CPU that produced it.
  *
- * NOTE: we may be able to implement this as a lockless queue, and allow any
- * context.  As the overhead is unknown, and region-based DAMON logics would
- * guarantee the reports would be not made that frequently, let's start with
- * this simple implementation.
+ * A backend whose PMU writes a record stream into a memory buffer instead of
+ * raising a per-sample interrupt, or one reading a device counter table, must
+ * therefore decode CPU N's buffer on CPU N -- for example by queueing per-CPU
+ * work with queue_work_on() -- rather than calling this function in a loop
+ * from one thread.  A single-thread loop puts every report in that thread's
+ * ring, which caps machine-wide capacity at DAMON_REPORT_RING_SIZE - 1
+ * reports per drain regardless of the number of producing CPUs, and does not
+ * satisfy the single-producer invariant if the thread can migrate.
+ *
+ * Context: any (NMI-safe).  An NMI nesting on top of a process-context
+ * producer on the same CPU would otherwise stomp the same entries[head]
+ * slot; the busy guard detects and drops in that case.
+ *
+ * If the ring is full, the sample is dropped and the per-CPU ring-full
+ * counter incremented; a busy-guard drop increments the busy-drop counter.
+ *
+ * Return: true if the report was queued, false if it was dropped.  A producer
+ * holding a single report may ignore this.  A producer decoding a batch out
+ * of a hardware buffer should stop on false and leave the remainder in that
+ * buffer for the next round, since a report released from the buffer but not
+ * queued here is not delivered.
  */
-void damon_report_access(struct damon_access_report *report)
+bool damon_report_access(struct damon_access_report *report)
 {
-	struct damon_access_report *dst;
+	/*
+	 * PA-only: perf-event reports only (probe_idx >= 1).  Reports without a
+	 * ctx or a perf ring (probe_idx == 0, page-fault path) are dropped.
+	 */
+	struct damon_report_ring *ring;
+	cpumask_t *pending;
+	int __percpu *busy_pcpu;
+	unsigned int head, next;
+	int busy;
+	bool queued = false;
+	struct damon_ctx *pctx = report->ctx;
 
-	/* silently fail for races */
-	if (!mutex_trylock(&damon_access_reports_lock))
-		return;
-	dst = &damon_access_reports[damon_access_reports_len++];
-	/* just drop all existing reports in favor of simplicity. */
-	if (damon_access_reports_len == DAMON_ACCESS_REPORTS_CAP)
-		damon_access_reports_len = 0;
-	*dst = *report;
-	dst->report_jiffies = jiffies;
-	mutex_unlock(&damon_access_reports_lock);
+	/*
+	 * A perf report must carry its owning ctx (set by the overflow handler)
+	 * and that ctx must have an allocated per-ctx perf ring.  If either is
+	 * missing (e.g. an overflow racing teardown after the ring was freed, or
+	 * a report raised before the ring was allocated), drop the sample rather
+	 * than touch NULL/freed storage.
+	 */
+	if (!pctx || !pctx->perf_rings || !pctx->perf_ring_busy)
+		return false;
+
+	/* Pin to a CPU so the SPSC invariant holds for preemptible callers. */
+	preempt_disable();
+	busy_pcpu = pctx->perf_ring_busy;
+	busy = this_cpu_inc_return(*busy_pcpu);
+	if (busy != 1) {
+		/* NMI nested on a process-context producer; drop. */
+		this_cpu_inc(damon_report_busy_drop_perf);
+		goto out;
+	}
+
+	ring = this_cpu_ptr(pctx->perf_rings);
+	pending = &pctx->perf_pending;
+	head = ring->head;
+	next = (head + 1) & DAMON_REPORT_RING_MASK;
+
+	if (next == READ_ONCE(ring->tail)) {
+		this_cpu_inc(damon_report_ring_full_perf);
+		goto out;
+	}
+
+	ring->entries[head] = *report;
+	ring->entries[head].report_jiffies = jiffies;
+	smp_wmb(); /* publish entry before head advance */
+	WRITE_ONCE(ring->head, next);
+	/*
+	 * Order the head advance before publishing the pending bit so
+	 * that the consumer, on observing the bit, is also guaranteed
+	 * to observe the new head.  cpumask_set_cpu / set_bit are
+	 * documented as unordered RMW (atomic_bitops.txt), hence the
+	 * explicit barrier.
+	 */
+	smp_mb__before_atomic();
+	cpumask_set_cpu(smp_processor_id(), pending);
+	queued = true;
+out:
+	this_cpu_dec(*busy_pcpu);
+	preempt_enable();
+	return queued;
 }
+EXPORT_SYMBOL_GPL(damon_report_access);
 
 #ifdef CONFIG_MMU
+/*
+ * PA-only series: no global page-fault ring.  Keep the symbol so mm/memory.c
+ * (which calls this unconditionally under CONFIG_DAMON) links cleanly.
+ */
 void damon_report_page_fault(struct vm_fault *vmf, bool huge_pmd)
 {
-	struct damon_access_report access_report = {
-		.vaddr = vmf->address,
-		.size = 1,	/* todo: set appripriately */
-		.cpu = smp_processor_id(),
-		.tid = task_pid_vnr(current),
-		.is_write = vmf->flags & FAULT_FLAG_WRITE,
-	};
-
-	if (huge_pmd)
-		access_report.paddr = PFN_PHYS(pmd_pfn(vmf->orig_pmd));
-	else
-		access_report.paddr = PFN_PHYS(pte_pfn(vmf->orig_pte));
-
-	damon_report_access(&access_report);
 }
-#endif
+#endif /* CONFIG_MMU */
+
 
 /*
  * Reset the aggregated monitoring results ('nr_accesses' of each region).
@@ -4191,6 +4589,24 @@ static void kdamond_init_ctx(struct damon_ctx *ctx)
 	}
 }
 
+static unsigned int kdamond_apply_zero_access_report(struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	unsigned int max_nr_accesses = 0;
+
+	damon_for_each_target(t, ctx) {
+		damon_for_each_region(r, t) {
+			if (r->access_reported)
+				r->access_reported = false;
+			else
+				damon_update_region_access_rate(r, false);
+			max_nr_accesses = max(max_nr_accesses, r->nr_accesses);
+		}
+	}
+	return max_nr_accesses;
+}
+
 static bool damon_sample_filter_matching(struct damon_access_report *report,
 		struct damon_sample_filter *filter)
 {
@@ -4218,89 +4634,301 @@ static bool damon_sample_filter_matching(struct damon_access_report *report,
 	return matched == filter->matching;
 }
 
+/*
+ * Decide whether a drained report should be dropped per the ctx sample
+ * filters.  A matching "!allow" (filter-out) filter drops the report; if no
+ * filter matched, the last filter's @allow acts as the default policy.
+ */
 static bool damon_sample_filter_out(struct damon_access_report *report,
 		struct damon_sample_control *ctrl)
 {
-	struct damon_sample_filter *filter;
+	struct damon_sample_filter *filter, *last = NULL;
 
 	damon_for_each_sample_filter(filter, ctrl) {
+		last = filter;
 		if (damon_sample_filter_matching(report, filter) &&
 				!filter->allow)
 			return true;
 	}
-	filter = damon_last_sample_filter_or_null(ctrl);
-	if (!filter)
+	if (!last)
 		return false;
-	return !filter->allow;
+	return !last->allow;
 }
 
-static void kdamond_apply_access_report(struct damon_access_report *report,
-		struct damon_target *t, struct damon_ctx *ctx)
-{
-	struct damon_region *r;
-	unsigned long addr;
-
-	if (damon_sample_filter_out(report, &ctx->sample_control))
-		return;
-	if (damon_target_has_pid(ctx))
-		addr = report->vaddr;
-	else
-		addr = report->paddr;
-
-	/* todo: make search faster, e.g., binary search? */
-	damon_for_each_region(r, t) {
-		if (addr < r->ar.start)
-			continue;
-		if (r->ar.end < addr + report->size)
-			continue;
-		if (!r->access_reported)
-			damon_update_region_access_rate(r, true);
-		r->access_reported = true;
-	}
-}
-
-static unsigned int kdamond_apply_zero_access_report(struct damon_ctx *ctx)
+/*
+ * Build a snapshot of the ctx's targets and their region arrays for use by
+ * the ring drain loop.  The snapshot buffer is reused across ticks, grown via
+ * krealloc only when a new high water mark is reached.
+ *
+ * The two-pass walk over adaptive_targets is safe even though krealloc_array()
+ * may sleep: target list mutation is funneled through damon_call onto the
+ * kdamond itself, so no other thread can mutate the list while kdamond runs
+ * this function.  Regions within a target are kept address-sorted by DAMON, so
+ * the snapshot arrays are directly binary-searchable.
+ */
+static struct damon_target_lookup *damon_build_target_lookup(
+		struct damon_ctx *ctx, unsigned int *nr_targets_out)
 {
 	struct damon_target *t;
-	struct damon_region *r;
-	unsigned int max_nr_accesses = 0;
+	struct damon_target_lookup *tbl;
+	unsigned int nr_targets = 0, total_regions = 0, ti = 0, ri = 0;
 
 	damon_for_each_target(t, ctx) {
-		damon_for_each_region(r, t) {
-			if (r->access_reported)
-				r->access_reported = false;
-			else
-				damon_update_region_access_rate(r, false);
-			max_nr_accesses = max(max_nr_accesses, r->nr_accesses);
-		}
+		nr_targets++;
+		total_regions += damon_nr_regions(t);
 	}
-	return max_nr_accesses;
+
+	if (nr_targets > ctx->drain_snapshot.nr_lookups) {
+		tbl = krealloc_array(ctx->drain_snapshot.lookups,
+				nr_targets, sizeof(*tbl), GFP_KERNEL);
+		if (!tbl)
+			return NULL;
+		ctx->drain_snapshot.lookups = tbl;
+		ctx->drain_snapshot.nr_lookups = nr_targets;
+	}
+	tbl = ctx->drain_snapshot.lookups;
+
+	if (total_regions > ctx->drain_snapshot.region_buf_cap) {
+		struct damon_region **buf;
+
+		buf = krealloc_array(ctx->drain_snapshot.region_buf,
+				total_regions, sizeof(*buf), GFP_KERNEL);
+		if (!buf)
+			return NULL;
+		ctx->drain_snapshot.region_buf = buf;
+		ctx->drain_snapshot.region_buf_cap = total_regions;
+	}
+
+	damon_for_each_target(t, ctx) {
+		struct damon_region *r;
+
+		tbl[ti].regions = &ctx->drain_snapshot.region_buf[ri];
+		tbl[ti].nr_regions = damon_nr_regions(t);
+		damon_for_each_region(r, t)
+			ctx->drain_snapshot.region_buf[ri++] = r;
+		ti++;
+	}
+
+	*nr_targets_out = nr_targets;
+	return tbl;
 }
 
-static unsigned int kdamond_check_reported_accesses(struct damon_ctx *ctx)
+/*
+ * Binary-search a sorted region snapshot for the region containing @addr and,
+ * on a hit, credit the report to @pidx.  Returns true if a region was credited
+ * (straddling reports that spill past the region end are rejected).
+ */
+static bool damon_credit_report_bsearch(struct damon_region **regions,
+		unsigned int nr_regions, unsigned long addr,
+		unsigned long size, int pidx)
 {
-	int i;
-	struct damon_access_report *report;
-	struct damon_target *t;
+	struct damon_region *r = NULL;
+	int left = 0, right = (int)nr_regions - 1, mid;
 
-	/* currently damon_access_report supports only physical address */
-	if (damon_target_has_pid(ctx))
-		return 0;
-
-	mutex_lock(&damon_access_reports_lock);
-	for (i = 0; i < damon_access_reports_len; i++) {
-		report = &damon_access_reports[i];
-		if (time_before(report->report_jiffies,
-					jiffies -
-					usecs_to_jiffies(
-						ctx->attrs.sample_interval)))
-			continue;
-		damon_for_each_target(t, ctx)
-			kdamond_apply_access_report(report, t, ctx);
+	while (left <= right) {
+		/* Avoid (left + right) overflow at large nr_regions. */
+		mid = left + (right - left) / 2;
+		if (addr < regions[mid]->ar.start)
+			right = mid - 1;
+		else if (addr >= regions[mid]->ar.end)
+			left = mid + 1;
+		else {
+			r = regions[mid];
+			break;
+		}
 	}
-	mutex_unlock(&damon_access_reports_lock);
-	/* For nr_accesses_bp, absence of access should also be reported. */
-	return kdamond_apply_zero_access_report(ctx);
+	if (!r)
+		return false;
+	/* Reject reports straddling a region boundary. */
+	if (addr + size > r->ar.end)
+		return false;
+
+	/*
+	 * pidx == 0 (page_fault / non-probe): credit access rate only.
+	 * Ring probe_idx is 1-based (0 == DAMON_PROBE_IDX_NONE sentinel), but
+	 * probe_hits[] storage is 0-based to match all readers (wsum, mvsum,
+	 * update, aggregate reset, merge). Convert here: probe_hits[pidx - 1].
+	 */
+	if (pidx > 0)
+		r->probe_hits[pidx - 1]++;
+	damon_update_region_access_rate(r, true);
+	r->access_reported = true;
+	return true;
+}
+
+/*
+ * __kdamond_drain_ring - drain ONE per-CPU SPSC ring into region probe_hits.
+ * @ctx:		draining context (owns @ring for this run).
+ * @tbl:		pre-built sorted per-target region snapshot (shared).
+ * @ring_pcpu:		the per-CPU ring base (pf or perf ring).
+ * @pending:		the matching per-ring pending cpumask.
+ *
+ * Drain one context's per-CPU SPSC perf ring into region probe_hits.
+ * This helper is the inner loop, parameterised by which ring + pending mask.
+ * The bsearch / straddle-reject / tid-filter /
+ * stale-window / sample-filter / probe_hits-crediting logic is unchanged from
+ * the prior single-ring drain.
+ *
+ * Each ring entry carries its own probe_idx (set by the overflow handler), so
+ * no list walk is needed to resolve the probe_hits[] slot.
+ *
+ * A per-target sorted region snapshot is built once per drain (by the caller)
+ * so each entry is matched to its region via O(log R) binary search rather
+ * than a linear damon_for_each_region() walk.  Iterates the ring's pending
+ * cpumask to drain only CPUs with published reports.
+ */
+static void __kdamond_drain_ring(struct damon_ctx *ctx,
+		struct damon_target_lookup *tbl,
+		struct damon_report_ring __percpu *ring_pcpu,
+		cpumask_t *pending)
+{
+	int cpu;
+	struct damon_report_ring *ring;
+	unsigned int tail, head;
+	struct damon_access_report *entry;
+	struct damon_target *t;
+	unsigned long match_addr;
+	bool found;
+	unsigned int ti;
+
+	/*
+	 * Unified paddr/vaddr drain.  The address space of the monitoring
+	 * target selects which address of the report is matched: contexts
+	 * whose targets carry a pid are monitoring a virtual address space and
+	 * match report->vaddr, the others match report->paddr.
+	 *
+	 * For pid-target contexts, filter by thread group id so entries from
+	 * unrelated processes are not credited to the wrong target.
+	 * damon_target_has_pid(ctx) gates this filter: it is false for paddr
+	 * ops, whose targets have no pid, so paddr crediting is unfiltered.
+	 */
+	for_each_cpu(cpu, pending) {
+		ring = per_cpu_ptr(ring_pcpu, cpu);
+		cpumask_clear_cpu(cpu, pending);
+		/*
+		 * Pair with the producer's smp_mb__before_atomic() between
+		 * the head publish and cpumask_set_cpu(): order the bit clear
+		 * before the head read so a producer publishing between the
+		 * clear and the READ_ONCE(head) is observed via the bit it
+		 * re-sets, not lost as a stale-head drain.
+		 */
+		smp_mb__after_atomic();
+		head = READ_ONCE(ring->head);
+		smp_rmb(); /* pair with smp_wmb in producer */
+		tail = ring->tail;
+
+		while (tail != head) {
+			unsigned long stale_before;
+			int pidx;
+
+			entry = &ring->entries[tail];
+			/*
+			 * Use sample_interval (not aggr_interval) as the
+			 * staleness window: entries older than one sample
+			 * interval are from a previous monitoring tick and
+			 * should not inflate the current aggregation window.
+			 */
+			stale_before = jiffies -
+				usecs_to_jiffies(ctx->attrs.sample_interval);
+			if (time_before(entry->report_jiffies, stale_before)) {
+				this_cpu_inc(damon_samples_stale_drained);
+				goto next;
+			}
+			pidx = entry->probe_idx;
+			/*
+			 * probe_idx == 0 (DAMON_PROBE_IDX_NONE) is the
+			 * page_fault / non-probe credit path: no probe_hits[]
+			 * slot, but it still credits the region access rate.
+			 * Reject only out-of-range indices (> DAMON_MAX_PROBES)
+			 * and, defensively, any negative value.
+			 */
+			if (pidx < 0 || pidx > DAMON_MAX_PROBES)
+				goto next;
+
+			/* Drop reports rejected by the ctx sample filters. */
+			if (damon_sample_filter_out(entry, &ctx->sample_control))
+				goto next;
+
+			/*
+			 * Select the address that matches the address space
+			 * the targets of this context are monitoring.  A
+			 * report that carries no address for that space
+			 * cannot be credited.
+			 */
+			if (damon_target_has_pid(ctx))
+				match_addr = entry->vaddr;
+			else
+				match_addr = entry->paddr;
+			if (!match_addr)
+				goto next;
+
+			found = false;
+			ti = 0;
+			damon_for_each_target(t, ctx) {
+				/* pid targets: match the reporting process */
+				if (damon_target_has_pid(ctx) &&
+				    pid_vnr(t->pid) != entry->tgid) {
+					ti++;
+					continue;
+				}
+				if (damon_credit_report_bsearch(tbl[ti].regions,
+						tbl[ti].nr_regions, match_addr,
+						entry->size, pidx)) {
+					this_cpu_inc(damon_samples_drained);
+					found = true;
+					break;
+				}
+				ti++;
+			}
+			if (!found)
+				this_cpu_inc(damon_samples_no_region);
+next:
+			tail = (tail + 1) & DAMON_REPORT_RING_MASK;
+		}
+		WRITE_ONCE(ring->tail, tail);
+	}
+}
+
+/*
+ * kdamond_check_reported_accesses - drain the per-ctx perf ring.
+ * Called from kdamond main loop after each sampling interval.
+ *
+ * PA-only: event-driven probes (probe_idx >= 1) place reports into
+ * ctx->perf_rings.  This function drains that ring for contexts that have
+ * event-driven probes registered.
+ */
+static void kdamond_check_reported_accesses(struct damon_ctx *ctx)
+{
+	struct damon_target_lookup *tbl;
+	unsigned int nr_targets = 0;
+
+	/*
+	 * Build the sorted region snapshot once for this drain.  If the alloc
+	 * fails, skip the drain this tick rather than falling back to a linear
+	 * scan (a missed tick self-heals; a linear scan does not).
+	 */
+	tbl = damon_build_target_lookup(ctx, &nr_targets);
+	if (!tbl) {
+		pr_warn_ratelimited(
+			"damon: target-lookup alloc failed; ring drain skipped this tick\n");
+		return;
+	}
+
+	/*
+	 * Defensive: the ring is allocated lazily at first perf probe setup;
+	 * a ctx can transiently have event-driven probes but no ring yet
+	 * (setup failed, or teardown already freed it).  Never pass NULL
+	 * to per_cpu_ptr().
+	 */
+	if (damon_drains_ring_perf(ctx) && ctx->perf_rings)
+		__kdamond_drain_ring(ctx, tbl, ctx->perf_rings,
+				&ctx->perf_pending);
+
+	/*
+	 * For nr_accesses, absence of access should also be reported:
+	 * regions with no ring report this tick get the decay update.
+	 */
+	kdamond_apply_zero_access_report(ctx);
 }
 
 /*
@@ -4349,7 +4977,9 @@ static int kdamond_fn(void *data)
 
 		do_prep = ctx->ops.prep_probes && damon_has_prep(ctx);
 
-		if (!access_check_disabled && ctx->ops.prepare_access_checks)
+		/* Page-fault sampling installs its markers from this callback. */
+		if ((!access_check_disabled) &&
+				ctx->ops.prepare_access_checks)
 			ctx->ops.prepare_access_checks(ctx);
 		if (do_prep)
 			ctx->ops.prep_probes(ctx, access_check_disabled);
@@ -4357,14 +4987,12 @@ static int kdamond_fn(void *data)
 		kdamond_usleep(sample_interval);
 		ctx->passed_sample_intervals++;
 
-		if (!access_check_disabled) {
-			/* todo: make these non-exclusive */
-			if (ctx->sample_control.primitives_enabled.page_fault)
-				max_merge_score =
-					kdamond_check_reported_accesses(ctx);
-			else if (ctx->ops.check_accesses)
-				max_merge_score = ctx->ops.check_accesses(ctx);
-		}
+		/* Drain the per-ctx perf ring if event-driven probes are active. */
+		if (damon_drains_ring_perf(ctx))
+			kdamond_check_reported_accesses(ctx);
+
+		if (!access_check_disabled && ctx->ops.check_accesses)
+			max_merge_score = ctx->ops.check_accesses(ctx);
 
 		if (ctx->ops.apply_probes) {
 			if (time_after_eq(ctx->passed_sample_intervals,
@@ -4460,6 +5088,25 @@ static int kdamond_fn(void *data)
 	}
 done:
 	damon_destroy_targets(ctx);
+
+#ifdef CONFIG_DAMON_PERF_SOURCE
+	/*
+	 * Release perf-event probes here so a stopped kdamond leaves no event
+	 * firing overflows into its report ring, and holds no PMU ownership
+	 * or provider module reference.  This runs in kdamond context, so a
+	 * provider's sleeping teardown is safe here.
+	 */
+	{
+		struct damon_probe *p, *next_p;
+
+		damon_for_each_probe_safe(p, next_p, ctx) {
+			if (p->perf_priv) {
+				damon_perf_probe_teardown(ctx, p->perf_priv);
+				p->perf_priv = NULL;
+			}
+		}
+	}
+#endif
 
 	kfree(ctx->regions_score_histogram);
 	mutex_lock(&ctx->call_controls_lock);
@@ -4620,3 +5267,5 @@ struct damon_region *damon_search(unsigned long addr, struct pid *pid)
 subsys_initcall(damon_init);
 
 #include "tests/core-kunit.h"
+#include "tests/drain-kunit.h"
+#include "tests/perf-kunit.h"
