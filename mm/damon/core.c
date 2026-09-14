@@ -1578,7 +1578,7 @@ static struct damos_filter *damos_nth_ops_filter(int n, struct damos *s)
 	return NULL;
 }
 
-static int damos_commit_filter_arg(
+static void damos_commit_filter_arg(
 		struct damos_filter *dst, struct damos_filter *src)
 {
 	switch (dst->type) {
@@ -1586,53 +1586,43 @@ static int damos_commit_filter_arg(
 		dst->memcg_id = src->memcg_id;
 		break;
 	case DAMOS_FILTER_TYPE_ADDR:
-		if (src->addr_range.end < src->addr_range.start)
-			return -EINVAL;
 		dst->addr_range = src->addr_range;
 		break;
 	case DAMOS_FILTER_TYPE_TARGET:
 		dst->target_idx = src->target_idx;
 		break;
 	case DAMOS_FILTER_TYPE_HUGEPAGE_SIZE:
-		if (src->sz_range.max < src->sz_range.min)
-			return -EINVAL;
 		dst->sz_range = src->sz_range;
 		break;
 	case DAMOS_FILTER_TYPE_PROBE_HITS_WSUM:
-		if (src->range_max < src->range_min)
-			return -EINVAL;
 		dst->range_min = src->range_min;
 		dst->range_max = src->range_max;
 		break;
 	default:
 		break;
 	}
-	return 0;
 }
 
-static int damos_commit_filter(
+static void damos_commit_filter(
 		struct damos_filter *dst, struct damos_filter *src)
 {
 	dst->type = src->type;
 	dst->matching = src->matching;
 	dst->allow = src->allow;
-	return damos_commit_filter_arg(dst, src);
+	damos_commit_filter_arg(dst, src);
 }
 
 static int damos_commit_core_filters(struct damos *dst, struct damos *src)
 {
 	struct damos_filter *dst_filter, *next, *src_filter, *new_filter;
-	int i = 0, j = 0, err;
+	int i = 0, j = 0;
 
 	damos_for_each_core_filter_safe(dst_filter, next, dst) {
 		src_filter = damos_nth_core_filter(i++, src);
-		if (src_filter) {
-			err = damos_commit_filter(dst_filter, src_filter);
-			if (err)
-				return err;
-		} else {
+		if (src_filter)
+			damos_commit_filter(dst_filter, src_filter);
+		else
 			damos_destroy_filter(dst_filter);
-		}
 	}
 
 	damos_for_each_core_filter_safe(src_filter, next, src) {
@@ -1644,11 +1634,7 @@ static int damos_commit_core_filters(struct damos *dst, struct damos *src)
 				src_filter->allow);
 		if (!new_filter)
 			return -ENOMEM;
-		err = damos_commit_filter_arg(new_filter, src_filter);
-		if (err) {
-			damos_destroy_filter(new_filter);
-			return err;
-		}
+		damos_commit_filter_arg(new_filter, src_filter);
 		damos_add_filter(dst, new_filter);
 	}
 	return 0;
@@ -1657,17 +1643,14 @@ static int damos_commit_core_filters(struct damos *dst, struct damos *src)
 static int damos_commit_ops_filters(struct damos *dst, struct damos *src)
 {
 	struct damos_filter *dst_filter, *next, *src_filter, *new_filter;
-	int i = 0, j = 0, err;
+	int i = 0, j = 0;
 
 	damos_for_each_ops_filter_safe(dst_filter, next, dst) {
 		src_filter = damos_nth_ops_filter(i++, src);
-		if (src_filter) {
-			err = damos_commit_filter(dst_filter, src_filter);
-			if (err)
-				return err;
-		} else {
+		if (src_filter)
+			damos_commit_filter(dst_filter, src_filter);
+		else
 			damos_destroy_filter(dst_filter);
-		}
 	}
 
 	damos_for_each_ops_filter_safe(src_filter, next, src) {
@@ -1679,11 +1662,7 @@ static int damos_commit_ops_filters(struct damos *dst, struct damos *src)
 				src_filter->allow);
 		if (!new_filter)
 			return -ENOMEM;
-		err = damos_commit_filter_arg(new_filter, src_filter);
-		if (err) {
-			damos_destroy_filter(new_filter);
-			return err;
-		}
+		damos_commit_filter_arg(new_filter, src_filter);
 		damos_add_filter(dst, new_filter);
 	}
 	return 0;
@@ -2080,7 +2059,7 @@ static int damon_commit_preps(struct damon_probe *dst, struct damon_probe *src)
 	return 0;
 }
 
-static int damon_commit_filter(struct damon_filter *dst,
+static void damon_commit_filter(struct damon_filter *dst,
 		struct damon_filter *src)
 {
 	dst->type = src->type;
@@ -2090,33 +2069,23 @@ static int damon_commit_filter(struct damon_filter *dst,
 	case DAMON_FILTER_TYPE_MEMCG:
 		dst->memcg_id = src->memcg_id;
 		break;
-	case DAMON_FILTER_TYPE_HUGEPAGE_SIZE:
-		if (src->range_max < src->range_min)
-			return -EINVAL;
-		dst->range_min = src->range_min;
-		dst->range_max = src->range_max;
-		break;
 	default:
 		break;
 	}
-	return 0;
 }
 
 static int damon_commit_filters(struct damon_probe *dst,
 		struct damon_probe *src)
 {
 	struct damon_filter *dst_filter, *next, *src_filter, *new_filter;
-	int i = 0, j = 0, err;
+	int i = 0, j = 0;
 
 	damon_for_each_filter_safe(dst_filter, next, dst) {
 		src_filter = damon_nth_filter(i++, src);
-		if (src_filter) {
-			err = damon_commit_filter(dst_filter, src_filter);
-			if (err)
-				return err;
-		} else {
+		if (src_filter)
+			damon_commit_filter(dst_filter, src_filter);
+		else
 			damon_destroy_filter(dst_filter);
-		}
 	}
 
 	damon_for_each_filter_safe(src_filter, next, src) {
@@ -2130,12 +2099,6 @@ static int damon_commit_filters(struct damon_probe *dst,
 		switch (src_filter->type) {
 		case DAMON_FILTER_TYPE_MEMCG:
 			new_filter->memcg_id = src_filter->memcg_id;
-			break;
-		case DAMON_FILTER_TYPE_HUGEPAGE_SIZE:
-			if (src_filter->range_max < src_filter->range_min)
-				return -EINVAL;
-			new_filter->range_min = src_filter->range_min;
-			new_filter->range_max = src_filter->range_max;
 			break;
 		default:
 			break;
@@ -3889,6 +3852,34 @@ static unsigned long damos_quota_score(struct damon_ctx *c, struct damos *s)
 		highest_score = max(highest_score,
 				mult_frac(goal->current_value, 10000,
 					goal->target_value));
+
+		/*
+		 * Per-tick visibility of NODE_ELIGIBLE_MEM_BP goal evaluation
+		 * for userspace convergence-detection.
+		 */
+		if (goal->metric == DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP &&
+		    trace_damos_node_eligible_mem_bp_enabled()) {
+			/*
+			 * cidx is hardcoded 0 because DAMON sysfs currently
+			 * supports a single context per kdamond.  Other DAMOS
+			 * tracepoints (damos_before_apply, damos_esz,
+			 * damos_stat_after_apply_interval) follow the same
+			 * convention; once multi-ctx-per-kdamond lands the
+			 * field becomes meaningful.
+			 */
+			unsigned int cidx = 0, sidx = 0;
+			struct damos *siter;
+
+			damon_for_each_scheme(siter, c) {
+				if (siter == s)
+					break;
+				sidx++;
+			}
+			trace_damos_node_eligible_mem_bp(cidx, sidx,
+					goal->nid,
+					goal->target_value,
+					goal->current_value);
+		}
 	}
 
 	return highest_score;
@@ -4010,8 +4001,6 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 			damos_trace_esz(c, s, quota);
 	}
 
-	if (damos_quota_is_full(quota, c->min_region_sz))
-		return;
 	if (!c->ops.get_scheme_score)
 		return;
 

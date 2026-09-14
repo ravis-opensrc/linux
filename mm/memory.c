@@ -7186,10 +7186,9 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
 	bool writable;
 	struct follow_pfnmap_args args = { .vma = vma, .address = addr };
 
-	/*
-	 * Limit access to one page at a time, as that's what follow_pfnmap_start()
-	 * guarantees; expect the caller to retry to read larger ranges.
-	 */
+	if (len <= 0)
+		return 0;
+
 	len = min_t(int, len, PAGE_SIZE - offset);
 
 retry:
@@ -7282,7 +7281,8 @@ static int __access_remote_vm(struct mm_struct *mm, unsigned long addr,
 #ifdef CONFIG_HAVE_IOREMAP_PROT
 			if (vma->vm_ops && vma->vm_ops->access)
 				bytes = vma->vm_ops->access(vma, addr, buf,
-							    len, write);
+							    min_t(int, len, PAGE_SIZE - offset_in_page(addr)),
+							    write);
 #endif
 			if (bytes <= 0)
 				break;

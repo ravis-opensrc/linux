@@ -460,10 +460,8 @@ void ida_dump(struct ida *);
  */
 void ida_check_nomem(void)
 {
-	struct ida ida;
+	DEFINE_IDA(ida);
 	int id;
-
-	ida_init(&ida);
 
 	id = ida_alloc_min(&ida, 256, GFP_NOWAIT);
 	IDA_BUG_ON(&ida, id != -ENOMEM);
@@ -477,10 +475,8 @@ void ida_check_nomem(void)
  */
 void ida_check_conv_user(void)
 {
-	struct ida ida;
+	DEFINE_IDA(ida);
 	unsigned long i;
-
-	ida_init(&ida);
 
 	for (i = 0; i < 1000000; i++) {
 		int id = ida_alloc(&ida, GFP_NOWAIT);
@@ -500,12 +496,10 @@ void ida_check_conv_user(void)
 
 void ida_check_random(void)
 {
-	struct ida ida;
+	DEFINE_IDA(ida);
 	DECLARE_BITMAP(bitmap, 2048);
 	unsigned int i;
 	time_t s = time(NULL);
-
-	ida_init(&ida);
 
  repeat:
 	memset(bitmap, 0, sizeof(bitmap));
@@ -528,10 +522,8 @@ void ida_check_random(void)
 
 void ida_alloc_free_test(void)
 {
-	struct ida ida;
+	DEFINE_IDA(ida);
 	unsigned long i;
-
-	ida_init(&ida);
 
 	for (i = 0; i < 10000; i++)
 		assert(ida_alloc_max(&ida, 20000, GFP_KERNEL) == i);
@@ -584,11 +576,9 @@ static void *ida_leak_fn(void *arg)
 
 void ida_thread_tests(void)
 {
-	struct ida ida;
+	DEFINE_IDA(ida);
 	pthread_t threads[20];
 	int i;
-
-	ida_init(&ida);
 
 	for (i = 0; i < ARRAY_SIZE(threads); i++)
 		if (pthread_create(&threads[i], NULL, ida_random_fn, NULL)) {

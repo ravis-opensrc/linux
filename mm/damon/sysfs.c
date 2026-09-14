@@ -802,6 +802,21 @@ damon_sysfs_prep_action_names[] = {
 	},
 };
 
+static ssize_t avail_prep_actions_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	int len = 0;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(damon_sysfs_prep_action_names); i++) {
+		const struct damon_sysfs_prep_action_name *action_name;
+
+		action_name = &damon_sysfs_prep_action_names[i];
+		len += sysfs_emit_at(buf, len, "%s\n", action_name->name);
+	}
+	return len;
+}
+
 static ssize_t prep_action_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -850,6 +865,9 @@ static void damon_sysfs_prep_release(struct kobject *kobj)
 
 	kfree(prep);
 }
+
+static struct kobj_attribute damon_sysfs_prep_avail_prep_actions_attr =
+		__ATTR_RO_MODE(avail_prep_actions, 0400);
 
 static struct kobj_attribute damon_sysfs_prep_prep_action_attr =
 		__ATTR_RW_MODE(prep_action, 0600);
@@ -955,6 +973,7 @@ DAMON_SYSFS_PREP_PERF_BOOL(freq, freq);
 DAMON_SYSFS_PREP_PERF_BOOL(single_instance, single_instance);
 
 static struct attribute *damon_sysfs_prep_attrs[] = {
+	&damon_sysfs_prep_avail_prep_actions_attr.attr,
 	&damon_sysfs_prep_prep_action_attr.attr,
 	&damon_sysfs_prep_type_attr.attr,
 	&damon_sysfs_prep_config_attr.attr,
@@ -1109,8 +1128,6 @@ struct damon_sysfs_filter {
 	bool matching;
 	bool allow;
 	char *path;
-	unsigned long range_min;
-	unsigned long range_max;
 };
 
 static struct damon_sysfs_filter *damon_sysfs_filter_alloc(void)
@@ -1141,11 +1158,22 @@ damon_sysfs_filter_type_names[] = {
 		.type = DAMON_FILTER_TYPE_PGIDLE_SET,
 		.name = "pgidle_set",
 	},
-	{
-		.type = DAMON_FILTER_TYPE_HUGEPAGE_SIZE,
-		.name = "hugepage_size",
-	},
 };
+
+static ssize_t avail_types_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	int len = 0;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(damon_sysfs_filter_type_names); i++) {
+		const struct damon_sysfs_filter_type_name *type_name;
+
+		type_name = &damon_sysfs_filter_type_names[i];
+		len += sysfs_emit_at(buf, len, "%s\n", type_name->name);
+	}
+	return len;
+}
 
 static ssize_t type_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -1267,44 +1295,6 @@ static ssize_t path_store(struct kobject *kobj,
 	return count;
 }
 
-static ssize_t min_show(struct kobject *kobj,
-		struct kobj_attribute *attr, char *buf)
-{
-	struct damon_sysfs_filter *filter = container_of(kobj,
-			struct damon_sysfs_filter, kobj);
-
-	return sysfs_emit(buf, "%lu\n", filter->range_min);
-}
-
-static ssize_t min_store(struct kobject *kobj,
-		struct kobj_attribute *attr, const char *buf, size_t count)
-{
-	struct damon_sysfs_filter *filter = container_of(kobj,
-			struct damon_sysfs_filter, kobj);
-	int err = kstrtoul(buf, 0, &filter->range_min);
-
-	return err ? err : count;
-}
-
-static ssize_t max_show(struct kobject *kobj,
-		struct kobj_attribute *attr, char *buf)
-{
-	struct damon_sysfs_filter *filter = container_of(kobj,
-			struct damon_sysfs_filter, kobj);
-
-	return sysfs_emit(buf, "%lu\n", filter->range_max);
-}
-
-static ssize_t max_store(struct kobject *kobj,
-		struct kobj_attribute *attr, const char *buf, size_t count)
-{
-	struct damon_sysfs_filter *filter = container_of(kobj,
-			struct damon_sysfs_filter, kobj);
-	int err = kstrtoul(buf, 0, &filter->range_max);
-
-	return err ? err : count;
-}
-
 static void damon_sysfs_filter_release(struct kobject *kobj)
 {
 	struct damon_sysfs_filter *filter = container_of(kobj,
@@ -1313,6 +1303,9 @@ static void damon_sysfs_filter_release(struct kobject *kobj)
 	kfree(filter->path);
 	kfree(filter);
 }
+
+static struct kobj_attribute damon_sysfs_filter_avail_types_attr =
+		__ATTR_RO_MODE(avail_types, 0400);
 
 static struct kobj_attribute damon_sysfs_filter_type_attr =
 		__ATTR_RW_MODE(type, 0600);
@@ -1326,19 +1319,12 @@ static struct kobj_attribute damon_sysfs_filter_allow_attr =
 static struct kobj_attribute damon_sysfs_filter_path_attr =
 		__ATTR_RW_MODE(path, 0600);
 
-static struct kobj_attribute damon_sysfs_filter_min_attr =
-		__ATTR_RW_MODE(min, 0600);
-
-static struct kobj_attribute damon_sysfs_filter_max_attr =
-		__ATTR_RW_MODE(max, 0600);
-
 static struct attribute *damon_sysfs_filter_attrs[] = {
+	&damon_sysfs_filter_avail_types_attr.attr,
 	&damon_sysfs_filter_type_attr.attr,
 	&damon_sysfs_filter_matching_attr.attr,
 	&damon_sysfs_filter_allow_attr.attr,
 	&damon_sysfs_filter_path_attr.attr,
-	&damon_sysfs_filter_min_attr.attr,
-	&damon_sysfs_filter_max_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(damon_sysfs_filter);
@@ -2497,9 +2483,6 @@ static int damon_sysfs_set_filters(struct damon_probe *probe,
 				damon_destroy_filter(filter);
 				return err;
 			}
-		} else if (filter->type == DAMON_FILTER_TYPE_HUGEPAGE_SIZE) {
-			filter->range_min = sys_filter->range_min;
-			filter->range_max = sys_filter->range_max;
 		}
 		damon_add_filter(probe, filter);
 	}

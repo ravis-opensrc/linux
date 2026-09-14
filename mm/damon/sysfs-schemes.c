@@ -595,6 +595,21 @@ damos_sysfs_filter_type_names[] = {
 	},
 };
 
+static ssize_t avail_types_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	int len = 0;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(damos_sysfs_filter_type_names); i++) {
+		const struct damos_sysfs_filter_type_name *type_name;
+
+		type_name = &damos_sysfs_filter_type_names[i];
+		len += sysfs_emit_at(buf, len, "%s\n", type_name->name);
+	}
+	return len;
+}
+
 static ssize_t type_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -843,6 +858,9 @@ static void damon_sysfs_scheme_filter_release(struct kobject *kobj)
 	kfree(filter);
 }
 
+static struct kobj_attribute damon_sysfs_scheme_filter_avail_types_attr =
+		__ATTR_RO_MODE(avail_types, 0400);
+
 static struct kobj_attribute damon_sysfs_scheme_filter_type_attr =
 		__ATTR_RW_MODE(type, 0600);
 
@@ -871,6 +889,7 @@ static struct kobj_attribute damon_sysfs_scheme_filter_damon_target_idx_attr =
 		__ATTR_RW_MODE(damon_target_idx, 0600);
 
 static struct attribute *damon_sysfs_scheme_filter_attrs[] = {
+	&damon_sysfs_scheme_filter_avail_types_attr.attr,
 	&damon_sysfs_scheme_filter_type_attr.attr,
 	&damon_sysfs_scheme_filter_matching_attr.attr,
 	&damon_sysfs_scheme_filter_allow_attr.attr,
@@ -2861,8 +2880,7 @@ static int damon_sysfs_add_scheme_filters(struct damos *scheme,
 
 		if (!filter)
 			return -ENOMEM;
-		switch (filter->type) {
-		case DAMOS_FILTER_TYPE_MEMCG:
+		if (filter->type == DAMOS_FILTER_TYPE_MEMCG) {
 			err = damon_sysfs_memcg_path_to_id(
 					sysfs_filter->memcg_path,
 					&filter->memcg_id);
@@ -2870,23 +2888,31 @@ static int damon_sysfs_add_scheme_filters(struct damos *scheme,
 				damos_destroy_filter(filter);
 				return err;
 			}
-			break;
-		case DAMOS_FILTER_TYPE_ADDR:
+		} else if (filter->type == DAMOS_FILTER_TYPE_ADDR) {
+			if (sysfs_filter->addr_range.end <
+					sysfs_filter->addr_range.start) {
+				damos_destroy_filter(filter);
+				return -EINVAL;
+			}
 			filter->addr_range = sysfs_filter->addr_range;
-			break;
-		case DAMOS_FILTER_TYPE_TARGET:
+		} else if (filter->type == DAMOS_FILTER_TYPE_TARGET) {
 			filter->target_idx = sysfs_filter->target_idx;
-			break;
-		case DAMOS_FILTER_TYPE_HUGEPAGE_SIZE:
+		} else if (filter->type == DAMOS_FILTER_TYPE_HUGEPAGE_SIZE) {
+			if (sysfs_filter->range_min >
+					sysfs_filter->range_max) {
+				damos_destroy_filter(filter);
+				return -EINVAL;
+			}
 			filter->sz_range.min = sysfs_filter->range_min;
 			filter->sz_range.max = sysfs_filter->range_max;
-			break;
-		case DAMOS_FILTER_TYPE_PROBE_HITS_WSUM:
+		} else if (filter->type == DAMOS_FILTER_TYPE_PROBE_HITS_WSUM) {
+			if (sysfs_filter->range_min >
+					sysfs_filter->range_max) {
+				damos_destroy_filter(filter);
+				return -EINVAL;
+			}
 			filter->range_min = sysfs_filter->range_min;
 			filter->range_max = sysfs_filter->range_max;
-			break;
-		default:
-			break;
 		}
 
 		damos_add_filter(scheme, filter);

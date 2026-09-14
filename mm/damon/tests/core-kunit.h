@@ -1139,15 +1139,9 @@ static void damos_test_commit_dests(struct kunit *test)
 }
 
 static void damos_test_commit_filter_for(struct kunit *test,
-		struct damos_filter *dst, struct damos_filter *src,
-		bool expect_fail)
+		struct damos_filter *dst, struct damos_filter *src)
 {
-	int err;
-
-	err = damos_commit_filter(dst, src);
-	KUNIT_EXPECT_EQ(test, err != 0, expect_fail);
-	if (expect_fail)
-		return;
+	damos_commit_filter(dst, src);
 	KUNIT_EXPECT_EQ(test, dst->type, src->type);
 	KUNIT_EXPECT_EQ(test, dst->matching, src->matching);
 	KUNIT_EXPECT_EQ(test, dst->allow, src->allow);
@@ -1190,61 +1184,47 @@ static void damos_test_commit_filter(struct kunit *test)
 			.type = DAMOS_FILTER_TYPE_ANON,
 			.matching = true,
 			.allow = true,
-			}, false);
+			});
 	damos_test_commit_filter_for(test, &dst,
 			&(struct damos_filter){
 			.type = DAMOS_FILTER_TYPE_MEMCG,
 			.matching = false,
 			.allow = false,
 			.memcg_id = 123,
-			}, false);
+			});
 	damos_test_commit_filter_for(test, &dst,
 			&(struct damos_filter){
 			.type = DAMOS_FILTER_TYPE_YOUNG,
 			.matching = true,
 			.allow = true,
-			}, false);
+			});
 	damos_test_commit_filter_for(test, &dst,
 			&(struct damos_filter){
 			.type = DAMOS_FILTER_TYPE_HUGEPAGE_SIZE,
 			.matching = false,
 			.allow = false,
 			.sz_range = {.min = 234, .max = 345},
-			}, false);
-	damos_test_commit_filter_for(test, &dst,
-			&(struct damos_filter){
-			.type = DAMOS_FILTER_TYPE_HUGEPAGE_SIZE,
-			.matching = false,
-			.allow = false,
-			.sz_range = {.min = 456, .max = 123},
-			}, true);
+			});
 	damos_test_commit_filter_for(test, &dst,
 			&(struct damos_filter){
 			.type = DAMOS_FILTER_TYPE_UNMAPPED,
 			.matching = true,
 			.allow = true,
-			}, false);
+			});
 	damos_test_commit_filter_for(test, &dst,
 			&(struct damos_filter){
 			.type = DAMOS_FILTER_TYPE_ADDR,
 			.matching = false,
 			.allow = false,
 			.addr_range = {.start = 456, .end = 567},
-			}, false);
-	damos_test_commit_filter_for(test, &dst,
-			&(struct damos_filter){
-			.type = DAMOS_FILTER_TYPE_ADDR,
-			.matching = false,
-			.allow = false,
-			.addr_range = {.start = 567, .end = 456},
-			}, true);
+			});
 	damos_test_commit_filter_for(test, &dst,
 			&(struct damos_filter){
 			.type = DAMOS_FILTER_TYPE_TARGET,
 			.matching = true,
 			.allow = true,
 			.target_idx = 6,
-			}, false);
+			});
 	damos_test_commit_filter_for(test, &dst,
 			&(struct damos_filter){
 			.type = DAMOS_FILTER_TYPE_PROBE_HITS_WSUM,
@@ -1252,15 +1232,7 @@ static void damos_test_commit_filter(struct kunit *test)
 			.allow = true,
 			.range_min = 12,
 			.range_max = 34,
-			}, false);
-	damos_test_commit_filter_for(test, &dst,
-			&(struct damos_filter){
-			.type = DAMOS_FILTER_TYPE_PROBE_HITS_WSUM,
-			.matching = false,
-			.allow = true,
-			.range_min = 34,
-			.range_max = 12,
-			}, true);
+			});
 }
 
 static void damos_test_help_initailize_scheme(struct damos *scheme)

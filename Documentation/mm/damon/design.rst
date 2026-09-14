@@ -378,8 +378,6 @@ filter types.  Currently below filter types are supported.
 - ``pgidle_unset``: Matches if the page for the memory is marked as not
   access-idle.
 - ``pgidle_set``: Matches if the page for the memory is marked as access-idle.
-- ``hugepage_size``: Matches if the page for the memory is a part of a hugepage
-  of a given size range.
 
 If such probes are registered, DAMON executes the probes for each region's
 sampling memory when it does the access :ref:`sampling
@@ -775,11 +773,9 @@ There are two such tuning algorithms that users can select as they need.
   This is the default selection.  If unsure, use this.
 - ``temporal``: More straightforward algorithm.  Tries to achieve the goal as
   fast as possible, using maximum allowed quota, but only for a temporal short
-  time.  When the goal is under-achieved, this algorithm keeps tuning quota to
-  a maximum allowed one.  Once the goal is [over-]achieved, this sets the
-  quota zero.  Useful for deterministic control required environments.  Note
-  that the zero quota is a valid quota, and therefore ``qt_exceeds`` :ref:`stat
-  <damon_design_damos_stat>` will keep increasing in this case.
+  time.  When the quota is under-achieved, this algorithm keeps tuning quota to
+  a maximum allowed one.  Once the quota is [over]-achieved, this sets the
+  quota zero.  Useful for deterministic control required environments.
 
 The goal can be specified with five parameters, namely ``target_metric``,
 ``target_value``, ``current_value``, ``nid`` and ``path``.  The auto-tuning

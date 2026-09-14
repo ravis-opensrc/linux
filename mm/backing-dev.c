@@ -910,9 +910,8 @@ static void cleanup_offline_cgwbs_workfn(struct work_struct *work)
 			continue;
 
 		spin_unlock_irq(&cgwb_lock);
-		do {
-			cond_resched_tasks_rcu_qs();
-		} while (cleanup_offline_cgwb(wb));
+		while (cleanup_offline_cgwb(wb))
+			cond_resched();
 		spin_lock_irq(&cgwb_lock);
 
 		wb_put(wb);

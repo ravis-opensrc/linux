@@ -134,7 +134,7 @@ void __meminit vmemmap_verify(pte_t *pte, int node,
 int __meminit section_nr_vmemmap_pages(unsigned long pfn, unsigned long nr_pages)
 {
 	const struct mem_section *ms = __pfn_to_section(pfn);
-	const int order = section_compound_order(ms);
+	const int order = section_order(ms);
 	const unsigned long pages_per_compound = 1UL << order;
 
 	VM_WARN_ON_ONCE(!IS_ALIGNED(pfn | nr_pages, PAGES_PER_SUBSECTION));
@@ -212,7 +212,7 @@ static __meminit void *vmemmap_alloc_pte(unsigned long pfn, int node,
 {
 	struct zone *zone;
 	struct page *page;
-	const unsigned int order = pfn_to_section_compound_order(pfn);
+	const unsigned int order = pfn_to_section_order(pfn);
 
 	/*
 	 * Device DAX still relies on vmemmap_populate_compound_pages() for
@@ -500,7 +500,7 @@ static int __meminit vmemmap_populate_compound_pages(unsigned long start_pfn,
 	int rc;
 	unsigned long flags = VMEMMAP_POPULATE_DAX;
 	struct page *page;
-	unsigned int order = pfn_to_section_compound_order(start_pfn);
+	unsigned int order = pfn_to_section_order(start_pfn);
 
 	page = vmemmap_shared_tail_page(order, device_zone(node));
 	if (!page)
@@ -767,7 +767,7 @@ static void section_deactivate(unsigned long pfn, unsigned long nr_pages,
 
 	if (empty) {
 		ms->section_mem_map = (unsigned long)NULL;
-		section_set_compound_order(ms, 0);
+		section_set_order(ms, 0);
 	}
 }
 
@@ -782,8 +782,8 @@ static struct page * __meminit section_activate(int nid, unsigned long pfn,
 	int rc;
 
 	order = vmemmap_can_optimize(altmap, pgmap) ? pgmap->vmemmap_shift : 0;
-	if (nr_pages < PAGES_PER_SECTION && section_compound_order(ms))
-		return ERR_PTR(-EOPNOTSUPP);
+	if (nr_pages < PAGES_PER_SECTION && section_order(ms))
+		return ERR_PTR(-ENOTSUPP);
 
 	if (!ms->usage) {
 		usage = kzalloc(mem_section_usage_size(), GFP_KERNEL);
@@ -810,7 +810,7 @@ static struct page * __meminit section_activate(int nid, unsigned long pfn,
 	if (nr_pages < PAGES_PER_SECTION && early_section(ms))
 		return pfn_to_page(pfn);
 
-	section_set_compound_order_range(pfn, nr_pages, order);
+	section_set_order_range(pfn, nr_pages, order);
 	memmap = populate_section_memmap(pfn, nr_pages, nid, altmap, pgmap);
 	if (!memmap) {
 		section_deactivate(pfn, nr_pages, altmap, pgmap);

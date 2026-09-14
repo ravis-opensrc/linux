@@ -43,7 +43,7 @@ then
 fi
 if ! echo "$kmemleak_report" | grep "memcg_path_store" --quiet
 then
-	echo "[WARN] memleak found; apparently not from DAMON, though"
+	echo "[WARN] memleak found; apparenty not from DAMON, though"
 	echo "$kmemleak_report"
 	exit 0
 fi

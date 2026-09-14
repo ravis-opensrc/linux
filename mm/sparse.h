@@ -58,7 +58,7 @@ static inline size_t mem_section_usage_size(void)
 
 static inline bool section_vmemmap_optimizable(const struct mem_section *ms)
 {
-	return vmemmap_optimizable_order(section_compound_order(ms));
+	return vmemmap_optimizable_order(section_order(ms));
 }
 #else
 static inline void sparse_init(void) {}

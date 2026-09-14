@@ -898,7 +898,7 @@ void __meminit memmap_init_range(unsigned long size, int nid, unsigned long zone
 		 * which have already been initialized during vmemmap population.
 		 */
 		if (vmemmap_optimizable_pfn(pfn)) {
-			const unsigned int order = pfn_to_section_compound_order(pfn);
+			unsigned int order = pfn_to_section_order(pfn);
 
 			pfn = min(ALIGN(pfn, 1UL << order), end_pfn);
 			continue;

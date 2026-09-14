@@ -244,7 +244,7 @@ static int span_iteration_check(void)
 	unsigned long start, last;
 	struct interval_tree_span_iter span, mas_span;
 
-	struct maple_tree tree;
+	DEFINE_MTREE(tree);
 
 	MA_STATE(mas, &tree, 0, 0);
 

@@ -191,6 +191,7 @@ static void __init memory_present(int nid, unsigned long start, unsigned long en
 	}
 }
 
+/* Initialize memory section metadata for all system memory. */
 void __init sparse_sections_init(void)
 {
 	unsigned long start, end;
@@ -213,7 +214,7 @@ struct page __init *__populate_section_memmap(unsigned long pfn,
 		unsigned long nr_pages, int nid, struct vmem_altmap *altmap,
 		struct dev_pagemap *pgmap)
 {
-	const unsigned long size = PAGE_ALIGN(sizeof(struct page) * PAGES_PER_SECTION);
+	unsigned long size = PAGE_ALIGN(sizeof(struct page) * PAGES_PER_SECTION);
 
 	return memmap_alloc(size, size, __pa(MAX_DMA_ADDRESS), nid, false);
 }

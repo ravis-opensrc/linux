@@ -125,7 +125,6 @@ struct mutex *hugetlb_fault_mutex_table __ro_after_init;
 
 /* Forward declaration */
 static int hugetlb_acct_memory(struct hstate *h, long delta);
-static unsigned int allowed_mems_nr(struct hstate *h);
 static void hugetlb_vma_lock_free(struct vm_area_struct *vma);
 static void hugetlb_vma_lock_alloc(struct vm_area_struct *vma);
 static void __hugetlb_vma_unlock_write_free(struct vm_area_struct *vma);
@@ -2254,19 +2253,6 @@ static nodemask_t *policy_mbind_nodemask(gfp_t gfp)
 }
 
 /*
- * Reservations are globally accounted, but they must also be backed by free
- * pages on nodes allowed by the current cpuset and MPOL_BIND policy.
- */
-static long surplus_pages_needed(struct hstate *h, long delta, long allocated)
-{
-	long global_free = (long)h->free_huge_pages + allocated;
-	long allowed_free = (long)allowed_mems_nr(h) + allocated;
-
-	return max((long)h->resv_huge_pages + delta - global_free,
-		   delta - allowed_free);
-}
-
-/*
  * Increase the hugetlb pool such that it can accommodate a reservation
  * of size 'delta'.
  */
@@ -2288,7 +2274,7 @@ static int gather_surplus_pages(struct hstate *h, long delta)
 		alloc_nodemask = cpuset_current_mems_allowed;
 
 	lockdep_assert_held(&hugetlb_lock);
-	needed = surplus_pages_needed(h, delta, 0);
+	needed = (h->resv_huge_pages + delta) - h->free_huge_pages;
 	if (needed <= 0) {
 		h->resv_huge_pages += delta;
 		return 0;
@@ -2319,10 +2305,11 @@ retry:
 
 	/*
 	 * After retaking hugetlb_lock, we need to recalculate 'needed'
-	 * because either resv_huge_pages or the free page counts may have changed.
+	 * because either resv_huge_pages or free_huge_pages may have changed.
 	 */
 	spin_lock_irq(&hugetlb_lock);
-	needed = surplus_pages_needed(h, delta, allocated);
+	needed = (h->resv_huge_pages + delta) -
+			(h->free_huge_pages + allocated);
 	if (needed > 0) {
 		if (alloc_ok)
 			goto retry;
@@ -3322,7 +3309,6 @@ static void __init gather_bootmem_prealloc_node(unsigned long nid)
 	list_for_each_entry_safe(m, tm, &huge_boot_pages[nid], list) {
 		struct page *page = virt_to_page(m);
 		struct folio *folio = (void *)page;
-		const unsigned long pfn = folio_pfn(folio);
 
 		h = m->hstate;
 		/*
@@ -3340,9 +3326,9 @@ static void __init gather_bootmem_prealloc_node(unsigned long nid)
 					   HUGETLB_VMEMMAP_RESERVE_PAGES);
 		init_new_hugetlb_folio(folio);
 
-		if (vmemmap_optimizable_order(pfn_to_section_compound_order(pfn)))
+		if (vmemmap_optimizable_order(pfn_to_section_order(folio_pfn(folio))))
 			folio_set_hugetlb_vmemmap_optimized(folio);
-		section_set_compound_order_range(pfn, folio_nr_pages(folio), 0);
+		section_set_order_range(folio_pfn(folio), folio_nr_pages(folio), 0);
 
 		list_add(&folio->lru, &folio_list);
 
@@ -5226,21 +5212,18 @@ int move_hugetlb_page_tables(struct vm_area_struct *vma,
 	hugetlb_vma_lock_write(vma);
 	i_mmap_lock_write(mapping);
 	for (; old_addr < old_end; old_addr += sz, new_addr += sz) {
-		const unsigned long remaining_size =
-			(old_addr | last_addr_mask) - old_addr;
-
 		src_pte = hugetlb_walk(vma, old_addr, sz);
 		if (!src_pte) {
-			old_addr += remaining_size;
-			new_addr += remaining_size;
+			old_addr |= last_addr_mask;
+			new_addr |= last_addr_mask;
 			continue;
 		}
 		if (huge_pte_none(huge_ptep_get(mm, old_addr, src_pte)))
 			continue;
 
 		if (huge_pmd_unshare(&tlb, vma, old_addr, src_pte)) {
-			old_addr += remaining_size;
-			new_addr += remaining_size;
+			old_addr |= last_addr_mask;
+			new_addr |= last_addr_mask;
 			continue;
 		}
 
@@ -6878,15 +6861,6 @@ long hugetlb_reserve_pages(struct inode *inode,
 
 out_put_pages:
 	spool_resv = chg - gbl_reserve;
-	/* Restore used_hpages for pages that failed global reservation */
-	if (gbl_reserve && spool) {
-		unsigned long flags;
-
-		spin_lock_irqsave(&spool->lock, flags);
-		if (spool->max_hpages != -1)
-			spool->used_hpages -= gbl_reserve;
-		unlock_or_release_subpool(spool, flags);
-	}
 	if (spool_resv) {
 		/* put sub pool's reservation back, chg - gbl_reserve */
 		gbl_resv = hugepage_subpool_put_pages(spool, spool_resv);
@@ -6895,6 +6869,15 @@ out_put_pages:
 		 * return to hstate.
 		 */
 		hugetlb_acct_memory(h, -gbl_resv);
+	}
+	/* Restore used_hpages for pages that failed global reservation */
+	if (gbl_reserve && spool) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&spool->lock, flags);
+		if (spool->max_hpages != -1)
+			spool->used_hpages -= gbl_reserve;
+		unlock_or_release_subpool(spool, flags);
 	}
 out_uncharge_cgroup:
 	hugetlb_cgroup_uncharge_cgroup_rsvd(hstate_index(h),

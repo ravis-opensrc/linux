@@ -4767,21 +4767,9 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 						struct alloc_context *ac)
 {
 	const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
-	/*
-	 * Costly __GFP_NORETRY callers have a cheap fallback to a lower order,
-	 * so don't stall them in direct reclaim or direct compaction.  Exempt
-	 * __GFP_THISNODE (the THP attempt from alloc_pages_mpol() needs direct
-	 * compaction) and __GFP_NOFAIL (must not be made to fail).  Don't
-	 * clear __GFP_DIRECT_RECLAIM from gfp_mask instead: that would also
-	 * change the alloc_flags derived by alloc_flags_slowpath().
-	 */
-	const bool costly_noretry = costly_order &&
-		(gfp_mask & __GFP_NORETRY) &&
-		!(gfp_mask & (__GFP_THISNODE | __GFP_NOFAIL));
-	bool can_direct_reclaim = !costly_noretry &&
-		(gfp_mask & __GFP_DIRECT_RECLAIM);
-	bool can_compact = can_direct_reclaim && gfp_compaction_allowed(gfp_mask);
-	bool nofail = gfp_mask & __GFP_NOFAIL;
+	bool can_direct_reclaim;
+	bool can_compact;
+	bool nofail;
 	struct page *page = NULL;
 	unsigned int alloc_flags;
 	unsigned long did_some_progress;
@@ -4795,6 +4783,18 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	bool compact_first = false;
 	bool can_retry_reserves = true;
 	unsigned long alloc_start_time = jiffies;
+
+	/*
+	 * Costly __GFP_NORETRY callers have a cheap fallback, so don't stall
+	 * them in reclaim or compaction. __GFP_THISNODE callers are exempt.
+	 */
+	if (costly_order && (gfp_mask & __GFP_NORETRY) &&
+	    !(gfp_mask & __GFP_THISNODE))
+		gfp_mask &= ~__GFP_DIRECT_RECLAIM;
+
+	can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;
+	can_compact = can_direct_reclaim && gfp_compaction_allowed(gfp_mask);
+	nofail = gfp_mask & __GFP_NOFAIL;
 
 	if (unlikely(nofail)) {
 		/*
@@ -5273,8 +5273,6 @@ retry_this_zone:
 		nr_account++;
 
 		prep_new_page(page, 0, gfp, ALLOC_DEFAULT);
-		trace_mm_page_alloc(page, 0, gfp, ac.migratetype);
-		kmsan_alloc_page(page, 0, gfp & ~__GFP_RECLAIM);
 		set_page_refcounted(page);
 		page_array[nr_populated++] = page;
 	}
@@ -5793,10 +5791,9 @@ static int numa_zonelist_order_handler(const struct ctl_table *table, int write,
 static int node_load[MAX_NUMNODES];
 
 /**
- * find_next_best_node_in - find the next node that should appear in a given node's fallback list
+ * find_next_best_node - find the next node that should appear in a given node's fallback list
  * @node: node whose fallback list we're appending
  * @used_node_mask: nodemask_t of already used nodes
- * @candidates: nodemask_t of nodes eligible for selection
  *
  * We use a number of factors to determine which is the next node that should
  * appear on a given node's fallback list.  The node should not have appeared
@@ -5808,8 +5805,7 @@ static int node_load[MAX_NUMNODES];
  *
  * Return: node id of the found node or %NUMA_NO_NODE if no node is found.
  */
-int find_next_best_node_in(int node, nodemask_t *used_node_mask,
-			   const nodemask_t *candidates)
+int find_next_best_node(int node, nodemask_t *used_node_mask)
 {
 	int n, val;
 	int min_val = INT_MAX;
@@ -5819,12 +5815,12 @@ int find_next_best_node_in(int node, nodemask_t *used_node_mask,
 	 * Use the local node if we haven't already, but for memoryless local
 	 * node, we should skip it and fall back to other nodes.
 	 */
-	if (!node_isset(node, *used_node_mask) && node_isset(node, *candidates)) {
+	if (!node_isset(node, *used_node_mask) && node_state(node, N_MEMORY)) {
 		node_set(node, *used_node_mask);
 		return node;
 	}
 
-	for_each_node_mask(n, *candidates) {
+	for_each_node_state(n, N_MEMORY) {
 
 		/* Don't want a node to appear more than once */
 		if (node_isset(n, *used_node_mask))
@@ -5858,6 +5854,31 @@ int find_next_best_node_in(int node, nodemask_t *used_node_mask,
 
 
 /*
+ * Build zonelists ordered by node and zones within node.
+ * This results in maximum locality--normal zone overflows into local
+ * DMA zone, if any--but risks exhausting DMA zone.
+ */
+static void build_zonelists_in_node_order(pg_data_t *pgdat, int *node_order,
+		unsigned nr_nodes)
+{
+	struct zoneref *zonerefs;
+	int i;
+
+	zonerefs = pgdat->node_zonelists[ZONELIST_FALLBACK]._zonerefs;
+
+	for (i = 0; i < nr_nodes; i++) {
+		int nr_zones;
+
+		pg_data_t *node = NODE_DATA(node_order[i]);
+
+		nr_zones = build_zonerefs_node(node, zonerefs);
+		zonerefs += nr_zones;
+	}
+	zonerefs->zone = NULL;
+	zonerefs->zone_idx = 0;
+}
+
+/*
  * Build __GFP_THISNODE zonelists
  */
 static void build_thisnode_zonelists(pg_data_t *pgdat)
@@ -5872,24 +5893,19 @@ static void build_thisnode_zonelists(pg_data_t *pgdat)
 	zonerefs->zone_idx = 0;
 }
 
-/*
- * Build one zonelist ordered by node and zones within node. This results in
- * maximum locality--normal zone overflows into local DMA zone, if any--but
- * risks exhausting DMA zone.
- */
-static void build_node_zonelist(pg_data_t *pgdat, const nodemask_t *candidates,
-				int zlidx)
+static void build_zonelists(pg_data_t *pgdat)
 {
-	struct zoneref *zonerefs = pgdat->node_zonelists[zlidx]._zonerefs;
+	static int node_order[MAX_NUMNODES];
+	int node, nr_nodes = 0;
 	nodemask_t used_mask = NODE_MASK_NONE;
-	int local_node = pgdat->node_id;
-	int prev_node = local_node;
-	int node;
+	int local_node, prev_node;
 
-	pr_info("Fallback order for Node %d: ", local_node);
+	/* NUMA-aware ordering of nodes */
+	local_node = pgdat->node_id;
+	prev_node = local_node;
 
-	while ((node = find_next_best_node_in(local_node, &used_mask,
-					      candidates)) >= 0) {
+	memset(node_order, 0, sizeof(node_order));
+	while ((node = find_next_best_node(local_node, &used_mask)) >= 0) {
 		/*
 		 * We don't want to pressure a particular node.
 		 * So adding penalty to the first node in same
@@ -5899,20 +5915,16 @@ static void build_node_zonelist(pg_data_t *pgdat, const nodemask_t *candidates,
 		    node_distance(local_node, prev_node))
 			node_load[node] += 1;
 
-		zonerefs += build_zonerefs_node(NODE_DATA(node), zonerefs);
-		pr_cont("%d ", node);
+		node_order[nr_nodes++] = node;
 		prev_node = node;
 	}
 
-	zonerefs->zone = NULL;
-	zonerefs->zone_idx = 0;
-	pr_cont("\n");
-}
-
-static void build_zonelists(pg_data_t *pgdat)
-{
-	build_node_zonelist(pgdat, &node_states[N_MEMORY], ZONELIST_FALLBACK);
+	build_zonelists_in_node_order(pgdat, node_order, nr_nodes);
 	build_thisnode_zonelists(pgdat);
+	pr_info("Fallback order for Node %d: ", local_node);
+	for (node = 0; node < nr_nodes; node++)
+		pr_cont("%d ", node_order[node]);
+	pr_cont("\n");
 }
 
 #ifdef CONFIG_HAVE_MEMORYLESS_NODES

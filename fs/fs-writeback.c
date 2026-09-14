@@ -727,34 +727,19 @@ static bool isw_prepare_wbs_switch(struct bdi_writeback *new_wb,
 				   struct inode_switch_wbs_context *isw,
 				   struct list_head *list, int *nr)
 {
-	struct inode *inode, *tmp;
-	LIST_HEAD(scanned);
-	bool full = false;
+	struct inode *inode;
 
-	/*
-	 * Walk from the oldest end and move scanned inodes to the newest
-	 * end, so the next scan resumes at unscanned inodes instead of
-	 * re-walking an ever-growing run of prepared and skipped ones.
-	 * For b_dirty_time this keeps the oldest unscanned inode at the
-	 * end move_expired_inodes() picks from; b_attached is unordered.
-	 */
-	list_for_each_entry_safe_reverse(inode, tmp, list, i_io_list) {
-		list_move(&inode->i_io_list, &scanned);
-
+	list_for_each_entry(inode, list, i_io_list) {
 		if (!inode_prepare_wbs_switch(inode, new_wb))
 			continue;
 
 		isw->inodes[*nr] = inode;
 		(*nr)++;
 
-		if (*nr >= WB_MAX_INODES_PER_ISW - 1) {
-			full = true;
-			break;
-		}
+		if (*nr >= WB_MAX_INODES_PER_ISW - 1)
+			return true;
 	}
-	list_splice(&scanned, list);
-
-	return full;
+	return false;
 }
 
 /**

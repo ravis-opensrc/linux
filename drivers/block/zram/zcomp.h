@@ -5,8 +5,6 @@
 
 #include <linux/mutex.h>
 
-struct scatterlist;
-
 #define ZCOMP_PARAM_NOT_SET	INT_MIN
 
 struct deflate_params {
@@ -93,6 +91,6 @@ void zcomp_stream_put(struct zcomp_strm *zstrm);
 int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
 		   const void *src, unsigned int *dst_len);
 int zcomp_decompress(struct zcomp *comp, struct zcomp_strm *zstrm,
-		     struct scatterlist *sg, unsigned int src_len, void *dst);
+		     const void *src, unsigned int src_len, void *dst);
 
 #endif /* _ZCOMP_H_ */

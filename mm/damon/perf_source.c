@@ -616,7 +616,7 @@ int damon_perf_probe_rearm(struct damon_ctx *ctx, struct damon_probe *probe,
 			   struct damon_perf_probe_event *old,
 			   struct damon_perf_probe_event *new)
 {
-	struct perf_event_attr old_attr = old->attr;
+	struct damon_perf_event_attr old_attr = old->attr;
 	/* Teardown frees @old; cache the PMU type before it is gone. */
 	unsigned int old_pmu_type = old->attr.type;
 	int err;
@@ -668,6 +668,58 @@ int damon_perf_probe_rearm(struct damon_ctx *ctx, struct damon_probe *probe,
 }
 EXPORT_SYMBOL_GPL(damon_perf_probe_rearm);
 
+
+#ifdef CONFIG_DEBUG_FS
+#include <linux/debugfs.h>
+
+static struct dentry *damon_perf_dbgfs_dir;
+
+static int damon_perf_dbgfs_show(struct seq_file *m, void *v)
+{
+	const char *name = m->private;
+	unsigned long val = 0;
+
+	if (!strcmp(name, "report_ring_full"))
+		val = damon_get_report_ring_full();
+	else if (!strcmp(name, "report_busy_drop"))
+		val = damon_get_report_busy_drop();
+	else if (!strcmp(name, "report_overflow"))
+		val = damon_get_report_overflow();
+	else if (!strcmp(name, "samples_drained"))
+		val = damon_get_samples_drained();
+	else if (!strcmp(name, "samples_stale_drained"))
+		val = damon_get_samples_stale_drained();
+	else if (!strcmp(name, "samples_no_region"))
+		val = damon_get_samples_no_region();
+
+	seq_printf(m, "%lu\n", val);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(damon_perf_dbgfs);
+
+static void damon_perf_debugfs_init(void)
+{
+	static const char * const names[] = {
+		"report_ring_full", "report_busy_drop", "report_overflow",
+		"samples_drained", "samples_stale_drained", "samples_no_region",
+	};
+	unsigned int i;
+
+	damon_perf_dbgfs_dir = debugfs_create_dir("damon_perf", NULL);
+	for (i = 0; i < ARRAY_SIZE(names); i++)
+		debugfs_create_file(names[i], 0444, damon_perf_dbgfs_dir,
+				    (void *)names[i], &damon_perf_dbgfs_fops);
+}
+
+static void damon_perf_debugfs_exit(void)
+{
+	debugfs_remove_recursive(damon_perf_dbgfs_dir);
+}
+#else
+static inline void damon_perf_debugfs_init(void) {}
+static inline void damon_perf_debugfs_exit(void) {}
+#endif /* CONFIG_DEBUG_FS */
+
 static int __init damon_perf_source_init(void)
 {
 	int ret;
@@ -679,6 +731,7 @@ static int __init damon_perf_source_init(void)
 	if (ret < 0)
 		return ret;
 	damon_perf_cpuhp_state = ret;
+	damon_perf_debugfs_init();
 	return 0;
 }
 
@@ -692,6 +745,7 @@ static void __exit damon_perf_source_exit(void)
 	}
 	spin_unlock(&damon_pmu_owner_lock);
 	cpuhp_remove_multi_state(damon_perf_cpuhp_state);
+	damon_perf_debugfs_exit();
 }
 
 module_init(damon_perf_source_init);

@@ -1686,10 +1686,24 @@ static inline bool zone_is_zone_device(const struct zone *zone)
 {
 	return zone_idx(zone) == ZONE_DEVICE;
 }
+
+#ifdef CONFIG_NUMA
+static inline struct zone *device_zone(int nid)
+{
+	return &NODE_DATA(nid)->node_zones[ZONE_DEVICE];
+}
+#endif
 #else
 static inline bool zone_is_zone_device(const struct zone *zone)
 {
 	return false;
+}
+#endif
+
+#if !defined(CONFIG_ZONE_DEVICE) && !defined(CONFIG_NUMA)
+static inline struct zone *device_zone(int nid)
+{
+	return NULL;
 }
 #endif
 
@@ -2026,7 +2040,7 @@ struct mem_section {
 	 * sections with HVO enabled, this tracks the compound page order
 	 * to enable deduplication of redundant vmemmap pages.
 	 */
-	unsigned int compound_page_order;
+	unsigned int order;
 #endif
 #ifdef CONFIG_PAGE_EXTENSION
 	/*
@@ -2149,20 +2163,10 @@ static inline int online_device_section(const struct mem_section *section)
 
 	return section && ((section->section_mem_map & flags) == flags);
 }
-
-static inline struct zone *device_zone(int nid)
-{
-	return &NODE_DATA(nid)->node_zones[ZONE_DEVICE];
-}
 #else
 static inline int online_device_section(const struct mem_section *section)
 {
 	return 0;
-}
-
-static inline struct zone *device_zone(int nid)
-{
-	return NULL;
 }
 #endif
 

@@ -685,7 +685,7 @@ void __init hugetlb_vmemmap_optimize_bootmem_page(unsigned long pfn, unsigned in
 	if (!READ_ONCE(vmemmap_optimize_enabled))
 		return;
 
-	section_set_compound_order_range(pfn, 1UL << order, order);
+	section_set_order_range(pfn, 1UL << order, order);
 }
 
 static const struct ctl_table hugetlb_vmemmap_sysctls[] = {

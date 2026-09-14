@@ -1236,7 +1236,7 @@ int __meminit vmemmap_populate_compound_pages(unsigned long start_pfn,
 	pmd_t *pmd;
 	pte_t *pte;
 	struct page *tail_page;
-	unsigned int order = pfn_to_section_compound_order(start_pfn);
+	unsigned int order = pfn_to_section_order(start_pfn);
 
 	tail_page = vmemmap_shared_tail_page(order, device_zone(node));
 	if (!tail_page)

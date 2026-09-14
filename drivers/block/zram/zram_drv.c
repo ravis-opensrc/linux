@@ -32,7 +32,6 @@
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
-#include <linux/scatterlist.h>
 #include <linux/kernel_read_file.h>
 #include <linux/rcupdate.h>
 
@@ -1348,9 +1347,9 @@ static int decompress_bdev_page(struct zram *zram, struct page *page,
 				unsigned long index)
 {
 	struct zcomp_strm *zstrm;
-	struct scatterlist sg[1];
 	unsigned int size;
 	int ret, prio;
+	void *src;
 
 	slot_lock(zram, index);
 	/* Since slot was unlocked we need to make sure it's still ZRAM_WB */
@@ -1369,18 +1368,13 @@ static int decompress_bdev_page(struct zram *zram, struct page *page,
 	size = get_slot_size(zram, index);
 	prio = get_slot_comp_priority(zram, index);
 
-	sg_init_table(sg, 1);
-	sg_set_page(sg, page, size, 0);
-
 	zstrm = zcomp_stream_get(zram->comps[prio]);
-	ret = zcomp_decompress(zram->comps[prio], zstrm, sg, size,
+	src = kmap_local_page(page);
+	ret = zcomp_decompress(zram->comps[prio], zstrm, src, size,
 			       zstrm->local_copy);
-	if (!ret) {
-		void *dst = kmap_local_page(page);
-
-		copy_page(dst, zstrm->local_copy);
-		kunmap_local(dst);
-	}
+	if (!ret)
+		copy_page(src, zstrm->local_copy);
+	kunmap_local(src);
 	zcomp_stream_put(zstrm);
 	slot_unlock(zram, index);
 
@@ -2092,19 +2086,15 @@ static int read_same_filled_page(struct zram *zram, struct page *page,
 static int read_incompressible_page(struct zram *zram, struct page *page,
 				    unsigned long index)
 {
-	struct scatterlist sg[2];
 	unsigned long handle;
 	void *src, *dst;
 
 	handle = get_slot_handle(zram, index);
-	zs_obj_read_sg_begin(zram->mem_pool, handle, sg, PAGE_SIZE);
-	/* an incompressible object never spans two pages */
-	src = kmap_local_page(sg_page(sg));
+	src = zs_obj_read_begin(zram->mem_pool, handle, PAGE_SIZE, NULL);
 	dst = kmap_local_page(page);
 	copy_page(dst, src);
 	kunmap_local(dst);
-	kunmap_local(src);
-	zs_obj_read_sg_end(zram->mem_pool, handle);
+	zs_obj_read_end(zram->mem_pool, handle, PAGE_SIZE, src);
 
 	return 0;
 }
@@ -2113,10 +2103,9 @@ static int read_compressed_page(struct zram *zram, struct page *page,
 				unsigned long index)
 {
 	struct zcomp_strm *zstrm;
-	struct scatterlist sg[2];
 	unsigned long handle;
 	unsigned int size;
-	void *dst;
+	void *src, *dst;
 	int ret, prio;
 
 	handle = get_slot_handle(zram, index);
@@ -2124,11 +2113,12 @@ static int read_compressed_page(struct zram *zram, struct page *page,
 	prio = get_slot_comp_priority(zram, index);
 
 	zstrm = zcomp_stream_get(zram->comps[prio]);
-	zs_obj_read_sg_begin(zram->mem_pool, handle, sg, size);
+	src = zs_obj_read_begin(zram->mem_pool, handle, size,
+				zstrm->local_copy);
 	dst = kmap_local_page(page);
-	ret = zcomp_decompress(zram->comps[prio], zstrm, sg, size, dst);
+	ret = zcomp_decompress(zram->comps[prio], zstrm, src, size, dst);
 	kunmap_local(dst);
-	zs_obj_read_sg_end(zram->mem_pool, handle);
+	zs_obj_read_end(zram->mem_pool, handle, size, src);
 	zcomp_stream_put(zstrm);
 
 	return ret;
@@ -2138,23 +2128,25 @@ static int read_compressed_page(struct zram *zram, struct page *page,
 static int read_from_zspool_raw(struct zram *zram, struct page *page,
 				unsigned long index)
 {
-	struct scatterlist sg[2];
+	struct zcomp_strm *zstrm;
 	unsigned long handle;
 	unsigned int size;
-	void *dst;
+	void *src;
 
 	handle = get_slot_handle(zram, index);
 	size = get_slot_size(zram, index);
 
 	/*
-	 * No decompression takes place here, we copy out raw compressed
-	 * data directly into the destination page.
+	 * We need to get stream just for ->local_copy buffer, in
+	 * case if object spans two physical pages. No decompression
+	 * takes place here, as we read raw compressed data.
 	 */
-	zs_obj_read_sg_begin(zram->mem_pool, handle, sg, size);
-	dst = kmap_local_page(page);
-	sg_copy_to_buffer(sg, sg_nents(sg), dst, size);
-	kunmap_local(dst);
-	zs_obj_read_sg_end(zram->mem_pool, handle);
+	zstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);
+	src = zs_obj_read_begin(zram->mem_pool, handle, size,
+				zstrm->local_copy);
+	memcpy_to_page(page, 0, src, size);
+	zs_obj_read_end(zram->mem_pool, handle, size, src);
+	zcomp_stream_put(zstrm);
 
 	memzero_page(page, size, PAGE_SIZE - size);
 
