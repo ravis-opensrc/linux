@@ -268,7 +268,7 @@ static unsigned int damon_pa_apply_probes(struct damon_ctx *ctx,
 			folio = damon_get_folio(PHYS_PFN(pa));
 			/*
 			 * Credit probe_hits[] for every probe whose filter
-			 * passes.  For event-driven probes (weight > 0) the
+			 * passes.  For event-driven probes (event_driven flag set) the
 			 * ring drain also credits probe_hits[], so hardware
 			 * probes accumulate from two sources; this is correct
 			 * and intentional -- the software-visible folio filter
