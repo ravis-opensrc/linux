@@ -4326,8 +4326,20 @@ static void kdamond_merge_regions(struct damon_ctx *c, unsigned int threshold,
 	while (true) {
 		nr_regions = 0;
 		damon_for_each_target(t, c) {
-			damon_merge_regions_of(t, threshold, sz_limit, c,
-					count_age);
+			struct damon_region *r;
+			unsigned int t_max = 0;
+
+			/*
+			 * Use the per-target maximum nr_accesses as the merge
+			 * threshold for this target.  A high-traffic target in
+			 * the same context must not set a threshold so permissive
+			 * that a low-traffic target's hot/cold boundary merges
+			 * away before the cold scheme can act on it.
+			 */
+			damon_for_each_region(r, t)
+				t_max = max(t_max, r->nr_accesses);
+			damon_merge_regions_of(t, min(threshold, t_max / 10),
+					sz_limit, c, count_age);
 			nr_regions += damon_nr_regions(t);
 		}
 		count_age = false;
