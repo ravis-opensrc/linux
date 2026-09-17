@@ -722,6 +722,42 @@ static void damon_test_bsearch_unsorted_regions(struct kunit *test)
 	damon_destroy_ctx(ctx);
 }
 
+/*
+ * Test that damon_primitives_enabled_invalid() accepts the both-disabled
+ * configuration when an event-driven probe is present (this commit's
+ * relaxation).
+ *
+ * Before this commit this configuration was rejected (-EINVAL).  After it,
+ * it is valid: the probe drives access-rate updates directly via the report
+ * ring, so neither software primitive is required.
+ */
+static void damon_test_both_primitives_disabled_with_probe(struct kunit *test)
+{
+	struct damon_ctx *ctx;
+	int ret;
+
+	ctx = damon_new_ctx();
+	if (!ctx)
+		kunit_skip(test, "ctx alloc failed");
+
+	if (damon_test_attach_perf_probe(ctx)) {
+		damon_destroy_ctx(ctx);
+		kunit_skip(test, "perf probe alloc failed");
+	}
+
+	/*
+	 * Explicitly disable both primitives.  With an event-driven probe
+	 * present, damon_commit_ctx() must now succeed outright.
+	 */
+	ctx->sample_control.primitives_enabled.page_table = false;
+	ctx->sample_control.primitives_enabled.page_fault  = false;
+
+	ret = damon_commit_ctx(ctx, ctx);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+
+	damon_destroy_ctx(ctx);
+}
+
 static struct kunit_case damon_drain_test_cases[] = {
 	KUNIT_CASE(damon_test_unified_vaddr_match),
 	KUNIT_CASE(damon_test_unified_vaddr_tgid_mismatch),
@@ -733,6 +769,7 @@ static struct kunit_case damon_drain_test_cases[] = {
 	KUNIT_CASE(damon_test_report_addr_space_keyed),
 	KUNIT_CASE(damon_test_ring_full_counter_increments),
 	KUNIT_CASE(damon_test_bsearch_unsorted_regions),
+	KUNIT_CASE(damon_test_both_primitives_disabled_with_probe),
 	{}
 };
 

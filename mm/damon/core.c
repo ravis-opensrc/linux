@@ -2362,9 +2362,6 @@ static int damon_commit_sample_control(
 		struct damon_sample_control *dst,
 		struct damon_sample_control *src)
 {
-	if (damon_primitives_enabled_invalid(&src->primitives_enabled))
-		return -EINVAL;
-
 	dst->primitives_enabled = src->primitives_enabled;
 	return damon_commit_sample_filters(dst, src);
 }
@@ -2421,6 +2418,10 @@ static int __damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src,
 	err = damon_commit_probes(dst, src, commit_live);
 	if (err)
 		return err;
+	/* Probe-driven context needs no software primitive */
+	if (!damon_has_event_driven_probes(src) &&
+	    damon_primitives_enabled_invalid(&src->sample_control.primitives_enabled))
+		return -EINVAL;
 	err = damon_commit_sample_control(&dst->sample_control,
 			&src->sample_control);
 	if (err)
