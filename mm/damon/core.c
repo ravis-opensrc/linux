@@ -2414,9 +2414,6 @@ static int damon_commit_sample_control(
 		struct damon_sample_control *dst,
 		struct damon_sample_control *src)
 {
-	if (damon_primitives_enabled_invalid(&src->primitives_enabled))
-		return -EINVAL;
-
 	dst->primitives_enabled = src->primitives_enabled;
 	return damon_commit_sample_filters(dst, src);
 }
@@ -2446,6 +2443,14 @@ static int __damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src,
 	}
 
 	if (!damon_valid_probe_params(src))
+		return -EINVAL;
+	/*
+	 * A probe-driven context needs no software primitive.  Validate this
+	 * before anything is committed to @dst, so a rejected configuration
+	 * cannot leave a live commit with its PMU events already armed.
+	 */
+	if (!damon_has_event_driven_probes(src) &&
+	    damon_primitives_enabled_invalid(&src->sample_control.primitives_enabled))
 		return -EINVAL;
 
 	err = damon_commit_schemes(dst, src);
