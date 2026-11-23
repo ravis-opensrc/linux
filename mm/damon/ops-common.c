@@ -4,6 +4,7 @@
  */
 
 #include <linux/hugetlb.h>
+#include <linux/memory-tiers.h>
 #include <linux/migrate.h>
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
@@ -403,6 +404,8 @@ static unsigned int __damon_migrate_folio_list(
 		int target_nid)
 {
 	unsigned int nr_succeeded = 0;
+	enum migrate_mode mode = MIGRATE_ASYNC;
+	nodemask_t lower_tiers;
 	struct migration_target_control mtc = {
 		/*
 		 * Allocate from 'node', or fail quickly and quietly.
@@ -420,9 +423,14 @@ static unsigned int __damon_migrate_folio_list(
 	if (list_empty(migrate_folios))
 		return 0;
 
+	/* Use non-temporal stores for lower-tier demotion to avoid cache pollution. */
+	node_get_allowed_targets(pgdat, &lower_tiers);
+	if (node_isset(target_nid, lower_tiers))
+		mode = MIGRATE_ASYNC_NONTEMPORAL;
+
 	/* Migration ignores all cpuset and mempolicy settings */
 	migrate_pages(migrate_folios, alloc_migration_target, NULL,
-		      (unsigned long)&mtc, MIGRATE_ASYNC, MR_DAMON,
+		      (unsigned long)&mtc, mode, MR_DAMON,
 		      &nr_succeeded);
 
 	return nr_succeeded;
