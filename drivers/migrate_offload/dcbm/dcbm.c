@@ -173,14 +173,19 @@ static int submit_dma_transfers(struct dma_work *work)
 	struct dma_async_tx_descriptor *tx;
 	unsigned long flags = DMA_CTRL_ACK;
 	dma_cookie_t cookie;
+	bool no_order, last;
 	int i;
 
+	/* Last-descriptor callback covers earlier ones only on ordered channels. */
+	no_order = dma_has_cap(DMA_COMPLETION_NO_ORDER,
+			       work->chan->device->cap_mask);
 	atomic_set(&work->pending, 1);
 
 	sg_src = work->src_sgt->sgl;
 	sg_dst = work->dst_sgt->sgl;
 	for_each_sgtable_dma_sg(work->src_sgt, sg_src, i) {
-		if (i == work->src_sgt->nents - 1)
+		last = i == work->src_sgt->nents - 1;
+		if (last || no_order)
 			flags |= DMA_PREP_INTERRUPT;
 
 		tx = dmaengine_prep_dma_memcpy(work->chan,
@@ -192,7 +197,9 @@ static int submit_dma_transfers(struct dma_work *work)
 			return -EIO;
 		}
 
-		if (i == work->src_sgt->nents - 1) {
+		if (last || no_order) {
+			if (!last)
+				atomic_inc(&work->pending);
 			tx->callback = dma_completion_callback;
 			tx->callback_param = work;
 		}
