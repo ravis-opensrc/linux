@@ -243,6 +243,8 @@ static int submit_dma_transfers(struct dma_work *work)
 	return 0;
 }
 
+static void dcbm_replace_channel(struct dma_chan *bad);
+
 /**
  * folios_copy_dma - copy a batch of folios via DMA memcpy
  * @dst_list: destination folio list
@@ -346,8 +348,11 @@ err_cleanup:
 	pr_warn_ratelimited("dcbm: DMA copy failed (%d), falling back to CPU\n",
 			    ret);
 	cleanup_dma_work(works, actual_channels);
-	kfree(works);
 	up_read(&dcbm_chan_sem);
+	for (i = 0; i < actual_channels; i++)
+		if (works[i].failed)
+			dcbm_replace_channel(works[i].chan);
+	kfree(works);
 
 	atomic_long_add(nr_folios, &folios_failures);
 	return ret;
@@ -613,6 +618,31 @@ static void dcbm_fill_work_fn(struct work_struct *work)
 	if (offloading_enabled)
 		dcbm_fill_channels();
 	mutex_unlock(&dcbm_mutex);
+}
+
+/*
+ * Drop and release a failed channel and let fill work request a fresh one.
+ * Runs inside migrate_offload SRCU read section, so do not take dcbm_mutex.
+ */
+static void dcbm_replace_channel(struct dma_chan *bad)
+{
+	unsigned int i;
+	bool found = false;
+
+	down_write(&dcbm_chan_sem);
+	for (i = 0; i < dcbm_nr_chans; i++) {
+		if (dcbm_chans[i] == bad) {
+			dcbm_chans[i] = dcbm_chans[--dcbm_nr_chans];
+			found = true;
+			break;
+		}
+	}
+	up_write(&dcbm_chan_sem);
+	if (!found)
+		return;
+
+	dma_release_channel(bad);
+	schedule_work(&dcbm_fill_work);
 }
 
 /* offloading: enable/disable DMA migration offload */
