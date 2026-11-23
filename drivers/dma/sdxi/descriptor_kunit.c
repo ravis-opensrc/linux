@@ -653,11 +653,55 @@ static void repcopy_invalid(struct kunit *t)
 	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
 }
 
+static void fill_plan(struct kunit *t)
+{
+	struct sdxi_fill_plan p;
+
+	KUNIT_EXPECT_EQ(t, SZ_2M, sdxi_repcopy_max_dst(0));
+	KUNIT_EXPECT_EQ(t, SZ_1G, sdxi_repcopy_max_dst(9));
+	KUNIT_EXPECT_EQ(t, SZ_4G, sdxi_repcopy_max_dst(11));
+	KUNIT_EXPECT_EQ(t, SZ_4G, sdxi_repcopy_max_dst(15));
+
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_plan_fill(0x1000, 0, 11, &p));
+
+	/* Aligned: body only. */
+	KUNIT_ASSERT_EQ(t, 0, sdxi_plan_fill(SZ_2M, SZ_2M, 11, &p));
+	KUNIT_EXPECT_EQ(t, p.head, 0);
+	KUNIT_EXPECT_EQ(t, p.tail, 0);
+	KUNIT_EXPECT_EQ(t, p.body, SZ_2M);
+	KUNIT_EXPECT_EQ(t, p.nr_body, 1);
+
+	/* Unaligned both ends. */
+	KUNIT_ASSERT_EQ(t, 0, sdxi_plan_fill(SZ_4K + 100, SZ_2M, 11, &p));
+	KUNIT_EXPECT_EQ(t, p.head, SZ_4K - 100);
+	KUNIT_EXPECT_EQ(t, p.body, SZ_2M - SZ_4K);
+	KUNIT_EXPECT_EQ(t, p.tail, 100);
+	KUNIT_EXPECT_EQ(t, p.head + p.body + p.tail, SZ_2M);
+
+	/* Entirely inside one page, and a head that ends the fill. */
+	KUNIT_ASSERT_EQ(t, 0, sdxi_plan_fill(0x1010, 32, 11, &p));
+	KUNIT_EXPECT_EQ(t, p.head, 32);
+	KUNIT_EXPECT_EQ(t, p.nr_body, 0);
+	KUNIT_EXPECT_EQ(t, p.tail, 0);
+	KUNIT_ASSERT_EQ(t, 0, sdxi_plan_fill(0x1ff0, 16, 11, &p));
+	KUNIT_EXPECT_EQ(t, p.head, 16);
+	KUNIT_EXPECT_EQ(t, p.nr_body + p.tail, 0);
+
+	/* Splitting on the chunk size. */
+	KUNIT_ASSERT_EQ(t, 0, sdxi_plan_fill(0, 16ULL * SZ_1G, 11, &p));
+	KUNIT_EXPECT_EQ(t, p.nr_body, 4);
+	KUNIT_ASSERT_EQ(t, 0, sdxi_plan_fill(0, 4ULL * SZ_1G + SZ_4K, 11, &p));
+	KUNIT_EXPECT_EQ(t, p.nr_body, 2);
+	KUNIT_ASSERT_EQ(t, 0, sdxi_plan_fill(0, 16ULL * SZ_1G, 0, &p));
+	KUNIT_EXPECT_EQ(t, p.nr_body, 8192);
+}
+
 static struct kunit_case generic_desc_tcs[] = {
 	KUNIT_CASE(encode_size32),
 	KUNIT_CASE(copy),
 	KUNIT_CASE(repcopy),
 	KUNIT_CASE(repcopy_invalid),
+	KUNIT_CASE(fill_plan),
 	KUNIT_CASE(intr),
 	KUNIT_CASE(cxt_start),
 	KUNIT_CASE(cxt_stop),

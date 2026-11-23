@@ -9,6 +9,7 @@
 #include <kunit/visibility.h>
 #include <linux/bitfield.h>
 #include <linux/bug.h>
+#include <linux/math64.h>
 #include <linux/range.h>
 #include <linux/sizes.h>
 #include <linux/types.h>
@@ -140,6 +141,35 @@ int sdxi_encode_repcopy(struct sdxi_desc *desc,
 	return 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(sdxi_encode_repcopy);
+
+/*
+ * A repeat copy may not write more than the context's max_buffer
+ * (2^(max_buffer + 21) bytes) nor more than 4 GiB (4 KiB * 2^20 copies).
+ */
+u64 sdxi_repcopy_max_dst(u8 max_buffer)
+{
+	return min_t(u64, (u64)SZ_2M << min_t(u8, max_buffer, 15), SZ_4G);
+}
+EXPORT_SYMBOL_IF_KUNIT(sdxi_repcopy_max_dst);
+
+int sdxi_plan_fill(dma_addr_t dst, u64 len, u8 max_buffer,
+		   struct sdxi_fill_plan *plan)
+{
+	u64 rest, chunk = sdxi_repcopy_max_dst(max_buffer);
+
+	if (!len || len > U64_MAX - dst)
+		return -EINVAL;
+
+	plan->head = min_t(u64, len, ALIGN(dst, SZ_4K) - dst);
+	rest = len - plan->head;
+	plan->body = ALIGN_DOWN(rest, SZ_4K);
+	plan->tail = rest - plan->body;
+	plan->chunk = chunk;
+	plan->nr_body = DIV64_U64_ROUND_UP(plan->body, chunk);
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(sdxi_plan_fill);
 
 int sdxi_encode_intr(struct sdxi_desc *desc,
 		     const struct sdxi_intr *params)

@@ -114,6 +114,24 @@ struct sdxi_repcopy {
 int sdxi_encode_repcopy(struct sdxi_desc *desc,
 			const struct sdxi_repcopy *params);
 
+/* Largest destination one repeat copy may cover for a context's max_buffer. */
+u64 sdxi_repcopy_max_dst(u8 max_buffer);
+
+/*
+ * How a byte fill of [dst, dst + len) maps onto descriptors: a partial
+ * 4 KiB head copy, repeat copies of up to @chunk bytes, a partial tail copy.
+ */
+struct sdxi_fill_plan {
+	u32 head;
+	u32 tail;
+	u64 body;
+	u64 chunk;
+	u32 nr_body;
+};
+
+int sdxi_plan_fill(dma_addr_t dst, u64 len, u8 max_buffer,
+		   struct sdxi_fill_plan *plan);
+
 struct sdxi_intr {
 	u16 akey;
 };

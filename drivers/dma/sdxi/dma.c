@@ -16,6 +16,7 @@
 #include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
+#include <linux/sizes.h>
 #include <linux/spinlock.h>
 
 #include "../dmaengine.h"
@@ -33,12 +34,25 @@ MODULE_PARM_DESC(dma_channels, "DMA channels per function (default: 1)");
 
 /*
  * Each channel owns an SDXI context. Transactions enter the ring in cookie
- * order. Each transaction produces one copy descriptor with its own completion
- * block, and batches end with a shared fenced interrupt descriptor. Each copy
- * owns its completion block until reaped. Transactions awaiting capacity remain
+ * order. Each copy produces one descriptor with its own completion block, and
+ * batches end with a shared fenced interrupt descriptor. A memset produces
+ * several descriptors, forms a batch of its own, and its last descriptor
+ * is fenced and carries the completion block. Each transaction owns its
+ * completion block until reaped. Transactions awaiting capacity remain
  * pending. Termination retains published transactions for reaping while
  * suppressing their callbacks.
  */
+
+/*
+ * Byte patterns for memset. A pattern page is shared by every in-flight
+ * memset of that value and is reused once nothing refers to it.
+ */
+#define SDXI_NR_PATTERNS 8
+
+struct sdxi_dma_pattern {
+	unsigned int refs;
+	u8 value;
+};
 
 struct sdxi_dma_chan {
 	struct virt_dma_chan vchan;
@@ -51,13 +65,28 @@ struct sdxi_dma_chan {
 	 * vchan.lock.
 	 */
 	struct list_head pending;
+
+	spinlock_t pattern_lock;	/* Protects pattern[] */
+	struct sdxi_dma_pattern pattern[SDXI_NR_PATTERNS];
+	u8 *pattern_pages;		/* SDXI_NR_PATTERNS pages of SZ_4K */
+	dma_addr_t pattern_dma;
+};
+
+struct sdxi_dma_op {
+	bool repeat;
+	union {
+		struct sdxi_copy copy;
+		struct sdxi_repcopy repcopy;
+	};
 };
 
 struct sdxi_dma_txd {
 	struct virt_dma_desc vdesc;
-	struct sdxi_copy copy;	/* Copy operation parameters */
 	/* Completion ownership is acquired at issue and released after reaping. */
 	struct sdxi_completion completion;
+	int pattern;	/* Held pattern slot, or -1 */
+	unsigned int nr_ops;
+	struct sdxi_dma_op ops[] __counted_by(nr_ops);
 };
 
 static void sdxi_dma_reap_locked(struct sdxi_dma_chan *sdchan);
@@ -82,11 +111,32 @@ to_sdxi_dma_txd(const struct virt_dma_desc *vdesc)
 	return container_of(vdesc, struct sdxi_dma_txd, vdesc);
 }
 
+static void sdxi_dma_txd_put(struct sdxi_dma_chan *sdchan,
+			     struct sdxi_dma_txd *txd)
+{
+	if (txd->pattern >= 0) {
+		scoped_guard(spinlock_irqsave, &sdchan->pattern_lock)
+			sdchan->pattern[txd->pattern].refs--;
+	}
+	kfree(txd);
+}
+
 static void sdxi_dma_txd_free(struct virt_dma_desc *vdesc)
 {
-	struct sdxi_dma_txd *txd = to_sdxi_dma_txd(vdesc);
+	sdxi_dma_txd_put(to_sdxi_dma_chan(vdesc->tx.chan),
+			 to_sdxi_dma_txd(vdesc));
+}
 
-	kfree(txd);
+static struct sdxi_dma_txd *sdxi_dma_txd_alloc(unsigned int nr_ops)
+{
+	struct sdxi_dma_txd *txd;
+
+	txd = kzalloc(struct_size(txd, ops, nr_ops), GFP_NOWAIT);
+	if (!txd)
+		return NULL;
+	txd->nr_ops = nr_ops;
+	txd->pattern = -1;
+	return txd;
 }
 
 static struct dma_async_tx_descriptor *
@@ -112,13 +162,123 @@ sdxi_dma_prep_memcpy(struct dma_chan *dma_chan, dma_addr_t dst,
 	if (sdxi_encode_copy(&(struct sdxi_desc){}, &copy))
 		return NULL;
 
-	txd = kmalloc_obj(*txd, GFP_NOWAIT);
+	txd = sdxi_dma_txd_alloc(1);
 	if (!txd)
 		return NULL;
+	txd->ops[0].copy = copy;
 
-	*txd = (typeof(*txd)) {
-		.copy = copy,
+	return vchan_tx_prep(&sdchan->vchan, &txd->vdesc, flags);
+}
+
+/* Take a pattern slot holding @value, filling a free one if needed. */
+static int sdxi_dma_pattern_get(struct sdxi_dma_chan *sdchan, u8 value)
+{
+	int free = -1;
+
+	guard(spinlock_irqsave)(&sdchan->pattern_lock);
+
+	for (int i = 0; i < SDXI_NR_PATTERNS; i++) {
+		struct sdxi_dma_pattern *pat = &sdchan->pattern[i];
+
+		if (pat->refs && pat->value == value) {
+			pat->refs++;
+			return i;
+		}
+		if (!pat->refs && free < 0)
+			free = i;
+	}
+	if (free < 0)
+		return -EBUSY;
+
+	memset(sdchan->pattern_pages + free * SZ_4K, value, SZ_4K);
+	sdchan->pattern[free].value = value;
+	sdchan->pattern[free].refs = 1;
+	return free;
+}
+
+static void sdxi_dma_op_copy(struct sdxi_dma_op *op, dma_addr_t dst,
+			     dma_addr_t src, u64 len, u16 akey)
+{
+	op->repeat = false;
+	op->copy = (struct sdxi_copy) {
+		.src = src,
+		.dst = dst,
+		.len = len,
+		.src_akey = akey,
+		.dst_akey = akey,
 	};
+}
+
+static struct dma_async_tx_descriptor *
+sdxi_dma_prep_memset(struct dma_chan *dma_chan, dma_addr_t dst, int value,
+		     size_t len, unsigned long flags)
+{
+	struct sdxi_dma_chan *sdchan = to_sdxi_dma_chan(dma_chan);
+	struct sdxi_cxt *cxt = sdchan->cxt;
+	u16 akey_index = sdxi_akey_index(cxt, sdchan->akey);
+	struct sdxi_fill_plan plan;
+	struct sdxi_dma_txd *txd;
+	dma_addr_t pat_dma;
+	unsigned int n = 0;
+	int pat;
+
+	if (sdxi_plan_fill(dst, len, cxt->sdxi->max_buffer, &plan))
+		return NULL;
+	/* The fill and its terminator must fit the ring in one batch. */
+	if ((u64)plan.nr_body + !!plan.head + !!plan.tail >
+	    cxt->ring_state->sq->count - 2)
+		return NULL;
+
+	pat = sdxi_dma_pattern_get(sdchan, (u8)value);
+	/* More than SDXI_NR_PATTERNS distinct values in flight. */
+	if (pat < 0)
+		return NULL;
+	pat_dma = sdchan->pattern_dma + pat * SZ_4K;
+
+	txd = sdxi_dma_txd_alloc(!!plan.head + plan.nr_body + !!plan.tail);
+	if (!txd) {
+		scoped_guard(spinlock_irqsave, &sdchan->pattern_lock)
+			sdchan->pattern[pat].refs--;
+		return NULL;
+	}
+	txd->pattern = pat;
+
+	/* Any offset into a uniform pattern page serves as the source. */
+	if (plan.head)
+		sdxi_dma_op_copy(&txd->ops[n++], dst, pat_dma, plan.head, akey_index);
+	dst += plan.head;
+	for (u64 left = plan.body; left;) {
+		u64 this = min(left, plan.chunk);
+
+		txd->ops[n].repeat = true;
+		txd->ops[n].repcopy = (struct sdxi_repcopy) {
+			.src = pat_dma,
+			.dst = dst,
+			.src_len = SZ_4K,
+			.nr_copies = this / SZ_4K,
+			.src_akey = akey_index,
+			.dst_akey = akey_index,
+			.zero = !value,
+		};
+		/* Validate now; the real encode happens at issue. */
+		if (sdxi_encode_repcopy(&(struct sdxi_desc){}, &txd->ops[n].repcopy)) {
+			sdxi_dma_txd_put(sdchan, txd);
+			return NULL;
+		}
+		n++;
+		dst += this;
+		left -= this;
+	}
+	if (plan.tail)
+		sdxi_dma_op_copy(&txd->ops[n++], dst, pat_dma, plan.tail, akey_index);
+
+	for (unsigned int i = 0; i < n; i++) {
+		if (!txd->ops[i].repeat &&
+		    sdxi_encode_copy(&(struct sdxi_desc){}, &txd->ops[i].copy)) {
+			sdxi_dma_txd_put(sdchan, txd);
+			return NULL;
+		}
+	}
 
 	return vchan_tx_prep(&sdchan->vchan, &txd->vdesc, flags);
 }
@@ -162,15 +322,26 @@ static bool sdxi_dma_drain_locked(struct sdxi_dma_chan *sdchan)
 		struct sdxi_ring_resv resv;
 		struct sdxi_desc *desc;
 		size_t claimed = 0, copies, i = 0;
+		bool multi = false;
+		size_t nr_slots;
 
-		/* Claim a pending prefix, stopping at a flag boundary or capacity limit. */
+		/*
+		 * Claim a pending prefix, stopping at a flag boundary or capacity
+		 * limit. A transaction with several descriptors is a batch of its own.
+		 */
 		list_for_each_entry(vdesc, &sdchan->pending, node) {
 			struct sdxi_dma_txd *txd = to_sdxi_dma_txd(vdesc);
 
+			if (txd->nr_ops > 1) {
+				if (claimed)
+					break;
+				multi = true;
+			}
 			if (!sdxi_cst_pool_get(cxt->cst_pool, &txd->completion))
 				break;
 			claimed++;
-			if (vdesc->tx.flags & (DMA_PREP_INTERRUPT | DMA_PREP_FENCE) ||
+			if (multi ||
+			    vdesc->tx.flags & (DMA_PREP_INTERRUPT | DMA_PREP_FENCE) ||
 			    claimed == rs->sq->count - 1)
 				break;
 		}
@@ -179,8 +350,15 @@ static bool sdxi_dma_drain_locked(struct sdxi_dma_chan *sdchan)
 
 		/* Ring reservations cannot be undone; acquire completions first. */
 		copies = 0;
-		if (!sdxi_ring_try_reserve_range(rs, 2, claimed + 1, &resv))
+		if (multi) {
+			vdesc = list_first_entry(&sdchan->pending,
+						 struct virt_dma_desc, node);
+			if (!sdxi_ring_try_reserve(rs, to_sdxi_dma_txd(vdesc)->nr_ops + 1,
+						   &resv))
+				copies = 1;
+		} else if (!sdxi_ring_try_reserve_range(rs, 2, claimed + 1, &resv)) {
 			copies = sdxi_ring_resv_count(&resv) - 1;
+		}
 
 		/* Return claims not covered by this (possibly failed) reservation. */
 		list_for_each_entry(vdesc, &sdchan->pending, node) {
@@ -195,17 +373,31 @@ static bool sdxi_dma_drain_locked(struct sdxi_dma_chan *sdchan)
 		}
 		if (!copies)
 			break;
-		for (size_t i = 0; i < copies; i++) {
+		nr_slots = sdxi_ring_resv_count(&resv);
+		for (size_t c = 0, s = 0; c < copies; c++) {
 			struct sdxi_dma_txd *txd;
-			struct sdxi_slot slot = sdxi_ring_resv_slot(&resv, i);
 
 			vdesc = list_first_entry(&sdchan->pending,
-						struct virt_dma_desc, node);
+						 struct virt_dma_desc, node);
 			txd = to_sdxi_dma_txd(vdesc);
-			desc = sdxi_slot_desc(slot);
-			(void)sdxi_encode_copy(desc, &txd->copy); /* validated at prep */
-			sdxi_cxt_attach_cst(slot, &txd->completion);
-			sdxi_desc_make_valid(desc);
+			for (unsigned int k = 0; k < txd->nr_ops; k++, s++) {
+				const struct sdxi_dma_op *op = &txd->ops[k];
+				struct sdxi_slot slot = sdxi_ring_resv_slot(&resv, s);
+
+				desc = sdxi_slot_desc(slot);
+				/* validated at prep */
+				if (op->repeat)
+					(void)sdxi_encode_repcopy(desc, &op->repcopy);
+				else
+					(void)sdxi_encode_copy(desc, &op->copy);
+				if (k == txd->nr_ops - 1) {
+					/* Complete only after the earlier descriptors. */
+					if (k)
+						sdxi_desc_set_fence(desc);
+					sdxi_cxt_attach_cst(slot, &txd->completion);
+				}
+				sdxi_desc_make_valid(desc);
+			}
 			list_move_tail(&vdesc->node, &sdchan->vchan.desc_issued);
 		}
 
@@ -214,7 +406,7 @@ static bool sdxi_dma_drain_locked(struct sdxi_dma_chan *sdchan)
 		 * subsequent copies (SDXI 1.0a 5.3, steps 7-9). One terminator
 		 * satisfies both flags and supplies internal completion IRQs.
 		 */
-		desc = sdxi_slot_desc(sdxi_ring_resv_slot(&resv, copies));
+		desc = sdxi_slot_desc(sdxi_ring_resv_slot(&resv, nr_slots - 1));
 		sdxi_encode_intr(desc, &(const struct sdxi_intr) {
 			.akey = sdxi_akey_index(cxt, sdchan->akey),
 		});
@@ -379,9 +571,18 @@ static int sdxi_dma_alloc_chan_resources(struct dma_chan *dma_chan)
 	struct sdxi_dma_chan *sdchan = to_sdxi_dma_chan(dma_chan);
 	int vector, irq, err;
 
-	sdchan->cxt = sdxi_cxt_new(sdxi);
-	if (!sdchan->cxt)
+	sdchan->pattern_pages = dma_alloc_coherent(sdxi->dev,
+						   SDXI_NR_PATTERNS * SZ_4K,
+						   &sdchan->pattern_dma, GFP_KERNEL);
+	if (!sdchan->pattern_pages)
 		return -ENOMEM;
+	memset(sdchan->pattern, 0, sizeof(sdchan->pattern));
+
+	sdchan->cxt = sdxi_cxt_new(sdxi);
+	if (!sdchan->cxt) {
+		err = -ENOMEM;
+		goto free_pattern;
+	}
 	err = vector = sdxi_alloc_vector(sdxi);
 	if (vector < 0)
 		goto exit_cxt;
@@ -429,6 +630,9 @@ free_vector:
 	sdxi_free_vector(sdxi, vector);
 exit_cxt:
 	sdxi_cxt_exit(sdchan->cxt);
+free_pattern:
+	dma_free_coherent(sdxi->dev, SDXI_NR_PATTERNS * SZ_4K,
+			  sdchan->pattern_pages, sdchan->pattern_dma);
 	return err;
 }
 
@@ -447,6 +651,8 @@ static void sdxi_dma_free_chan_resources(struct dma_chan *dma_chan)
 	vchan_dma_desc_free_list(&sdchan->vchan, &head);
 	vchan_free_chan_resources(to_virt_chan(dma_chan));
 	sdxi_cxt_exit(sdchan->cxt);
+	dma_free_coherent(dma_chan->device->dev, SDXI_NR_PATTERNS * SZ_4K,
+			  sdchan->pattern_pages, sdchan->pattern_dma);
 }
 
 int sdxi_dma_register(struct sdxi_dev *sdxi)
@@ -483,6 +689,8 @@ int sdxi_dma_register(struct sdxi_dev *sdxi)
 		.device_free_chan_resources  = sdxi_dma_free_chan_resources,
 
 		.device_prep_dma_memcpy = sdxi_dma_prep_memcpy,
+		.device_prep_dma_memset = sdxi_dma_prep_memset,
+		.fill_align = DMAENGINE_ALIGN_1_BYTE,
 
 		.device_terminate_all = sdxi_dma_terminate_all,
 		.device_synchronize = sdxi_dma_synchronize,
@@ -491,6 +699,7 @@ int sdxi_dma_register(struct sdxi_dev *sdxi)
 	};
 
 	dma_cap_set(DMA_MEMCPY, dma_dev->cap_mask);
+	dma_cap_set(DMA_MEMSET, dma_dev->cap_mask);
 	INIT_LIST_HEAD(&dma_dev->channels);
 
 	for (size_t i = 0; i < sddev->nr_channels; ++i) {
@@ -499,6 +708,7 @@ int sdxi_dma_register(struct sdxi_dev *sdxi)
 		sdchan->vchan.desc_free = sdxi_dma_txd_free;
 		vchan_init(&sdchan->vchan, &sddev->dma_dev);
 		INIT_LIST_HEAD(&sdchan->pending);
+		spin_lock_init(&sdchan->pattern_lock);
 	}
 
 	err = dmaenginem_async_device_register(dma_dev);
