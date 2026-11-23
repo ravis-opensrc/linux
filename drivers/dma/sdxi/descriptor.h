@@ -96,6 +96,24 @@ struct sdxi_copy {
 int sdxi_encode_copy(struct sdxi_desc *desc,
 		     const struct sdxi_copy *params);
 
+/*
+ * Repeat copy: @nr_copies back-to-back copies of the @src_len byte
+ * source at @src, starting at @dst. All addresses and lengths are
+ * multiples of 4 KiB. @zero promises that the source is all zeroes.
+ */
+struct sdxi_repcopy {
+	dma_addr_t src;
+	dma_addr_t dst;
+	u64 src_len;
+	u64 nr_copies;
+	u16 src_akey;
+	u16 dst_akey;
+	bool zero;
+};
+
+int sdxi_encode_repcopy(struct sdxi_desc *desc,
+			const struct sdxi_repcopy *params);
+
 struct sdxi_intr {
 	u16 akey;
 };

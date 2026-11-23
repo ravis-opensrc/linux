@@ -18,6 +18,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/module.h>
 #include <linux/packing.h>
+#include <linux/sizes.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
 
@@ -59,6 +60,34 @@ static const struct packed_field_u16 copy_subfields[] = {
 	copy_field(127, 112, akey1),
 	copy_field(191, 128, addr0),
 	copy_field(255, 192, addr1),
+};
+
+/* DMAB_REPCOPY */
+struct unpacked__repcopy {
+	u16 nsize;
+	u8 attr_src;
+	u8 attr_dst;
+	u16 akey0;
+	u16 akey1;
+	bool az;
+	u64 addr0;
+	u64 addr1;
+	u32 num;
+};
+
+#define repcopy_field(_high, _low, _member) \
+	desc_field(_high, _low, struct unpacked__repcopy, _member)
+
+static const struct packed_field_u16 repcopy_subfields[] = {
+	repcopy_field(52, 44, nsize),
+	repcopy_field(67, 64, attr_src),
+	repcopy_field(71, 68, attr_dst),
+	repcopy_field(111, 96, akey0),
+	repcopy_field(127, 112, akey1),
+	repcopy_field(128, 128, az),
+	repcopy_field(191, 140, addr0),
+	repcopy_field(255, 204, addr1),
+	repcopy_field(287, 268, num),
 };
 
 /* DSC_INTR */
@@ -177,6 +206,7 @@ struct unpacked_desc {
 	bool np;
 	union {
 		struct unpacked__copy copy;
+		struct unpacked__repcopy repcopy;
 		struct unpacked__intr intr;
 		struct unpacked__sync sync;
 		struct unpacked__cxt_start cxt_start;
@@ -230,6 +260,7 @@ static const struct packed_field_u16 generic_subfields[] = {
 
 define_unpack_fn(intr)
 define_unpack_fn(copy)
+define_unpack_fn(repcopy)
 define_unpack_fn(sync)
 define_unpack_fn(cxt_start)
 define_unpack_fn(cxt_stop)
@@ -505,9 +536,128 @@ static void sync(struct kunit *t)
 	KUNIT_EXPECT_EQ(t, unpacked.sync.cxt_end, U16_MAX);
 }
 
+static void repcopy(struct kunit *t)
+{
+	static const u64 sizes[] = { SZ_4K, SZ_8K, SZ_64K, SZ_1M, SZ_2M };
+	static const u64 counts[] = { 1, 2, 17, 512, BIT_ULL(20) };
+	struct unpacked_desc unpacked;
+	struct sdxi_desc desc;
+	struct sdxi_repcopy rc;
+
+	for (int i = 0; i < ARRAY_SIZE(sizes); i++) {
+		for (int j = 0; j < ARRAY_SIZE(counts); j++) {
+			rc = (struct sdxi_repcopy) {
+				.src = 0x100000,
+				.dst = 0x20000000000,
+				.src_len = sizes[i],
+				.nr_copies = counts[j],
+				.src_akey = 3,
+				.dst_akey = 5,
+			};
+			desc_poison(&desc);
+			KUNIT_ASSERT_EQ(t, 0, sdxi_encode_repcopy(&desc, &rc));
+			unpack_repcopy(&unpacked, &desc);
+
+			KUNIT_EXPECT_EQ(t, unpacked.vl, 0);
+			KUNIT_EXPECT_EQ(t, unpacked.type, SDXI_DSC_OP_TYPE_DMAB);
+			KUNIT_EXPECT_EQ(t, unpacked.subtype, SDXI_DSC_OP_SUBTYPE_REPCOPY);
+			KUNIT_EXPECT_EQ(t, unpacked.np, 1);
+			/* Both counts are encoded as value - 1, not shifted. */
+			KUNIT_EXPECT_EQ(t, unpacked.repcopy.nsize, sizes[i] / SZ_4K - 1);
+			KUNIT_EXPECT_EQ(t, unpacked.repcopy.num, counts[j] - 1);
+			KUNIT_EXPECT_EQ(t, unpacked.repcopy.addr0, rc.src >> 12);
+			KUNIT_EXPECT_EQ(t, unpacked.repcopy.addr1, rc.dst >> 12);
+			KUNIT_EXPECT_EQ(t, unpacked.repcopy.akey0, 3);
+			KUNIT_EXPECT_EQ(t, unpacked.repcopy.akey1, 5);
+			KUNIT_EXPECT_EQ(t, unpacked.repcopy.az, 0);
+		}
+	}
+
+	/* az is set only on request and does not disturb the address. */
+	rc = (struct sdxi_repcopy) {
+		.src = 0x7ffff000,
+		.dst = 0x80000000,
+		.src_len = SZ_4K,
+		.nr_copies = 4,
+		.zero = true,
+	};
+	KUNIT_ASSERT_EQ(t, 0, sdxi_encode_repcopy(&desc, &rc));
+	unpack_repcopy(&unpacked, &desc);
+	KUNIT_EXPECT_EQ(t, unpacked.repcopy.az, 1);
+	KUNIT_EXPECT_EQ(t, unpacked.repcopy.addr0, 0x7ffff);
+	KUNIT_EXPECT_EQ(t, unpacked.repcopy.addr1, 0x80000);
+}
+
+static void repcopy_invalid(struct kunit *t)
+{
+	struct sdxi_desc desc = {};
+	struct sdxi_repcopy ok = {
+		.src = 0x1000,
+		.dst = 0x100000,
+		.src_len = SZ_4K,
+		.nr_copies = 1,
+	};
+	struct sdxi_repcopy rc;
+
+	KUNIT_ASSERT_EQ(t, 0, sdxi_encode_repcopy(&desc, &ok));
+
+	rc = ok;
+	rc.src |= 0x10;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+
+	rc = ok;
+	rc.dst |= 0x800;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+
+	rc = ok;
+	rc.src_len = 0;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+
+	rc = ok;
+	rc.src_len = SZ_4K - 1;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+
+	rc = ok;
+	rc.src_len = SZ_2M + SZ_4K;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+
+	rc = ok;
+	rc.nr_copies = 0;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+
+	rc = ok;
+	rc.nr_copies = BIT_ULL(20) + 1;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+
+	/* The last copy lands on the source. */
+	rc = ok;
+	rc.src = 0x3000;
+	rc.dst = 0x1000;
+	rc.nr_copies = 3;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+	rc.nr_copies = 2;
+	KUNIT_EXPECT_EQ(t, 0, sdxi_encode_repcopy(&desc, &rc));
+
+	/* A destination run that wraps past the top of the address space. */
+	rc = ok;
+	rc.dst = U64_MAX - SZ_4K + 1;
+	rc.nr_copies = 2;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+	rc.nr_copies = 1;
+	KUNIT_EXPECT_EQ(t, 0, sdxi_encode_repcopy(&desc, &rc));
+
+	/* A source that wraps. */
+	rc = ok;
+	rc.src = U64_MAX - SZ_4K + 1;
+	rc.src_len = SZ_8K;
+	KUNIT_EXPECT_EQ(t, -EINVAL, sdxi_encode_repcopy(&desc, &rc));
+}
+
 static struct kunit_case generic_desc_tcs[] = {
 	KUNIT_CASE(encode_size32),
 	KUNIT_CASE(copy),
+	KUNIT_CASE(repcopy),
+	KUNIT_CASE(repcopy_invalid),
 	KUNIT_CASE(intr),
 	KUNIT_CASE(cxt_start),
 	KUNIT_CASE(cxt_stop),

@@ -172,6 +172,24 @@ struct sdxi_desc {
 			__u8 rsvd_1[24];
 		);
 
+		/* SDXI 1.0 Table 6-9: DSC_DMAB_REPCOPY Descriptor Format */
+		define_sdxi_dsc(sdxi_dsc_dmab_repcopy, repcopy,
+			__le32 nsize;
+			__u8 attr;
+			__u8 rsvd_0[3];
+			__le16 akey0;
+			__le16 akey1;
+			__le64 addr0;
+			__le64 addr1;
+			__le32 num;
+			__u8 rsvd_1[20];
+		);
+/* For use with repcopy.nsize, .addr0, .addr1 and .num */
+#define SDXI_DSC_REPCOPY_NSIZE GENMASK(20, 12)
+#define SDXI_DSC_REPCOPY_AZ BIT_ULL(0)
+#define SDXI_DSC_REPCOPY_ADDR GENMASK_ULL(63, 12)
+#define SDXI_DSC_REPCOPY_NUM GENMASK(31, 12)
+
 		/* SDXI 1.0 Table 6-12: DSC_INTR Descriptor Format */
 		define_sdxi_dsc(sdxi_dsc_intr, intr,
 			__u8 rsvd_0[8];
@@ -243,6 +261,7 @@ enum sdxi_dsc_type {
 enum sdxi_dsc_subtype {
 	/* DMA Base */
 	SDXI_DSC_OP_SUBTYPE_COPY    = 0x03,
+	SDXI_DSC_OP_SUBTYPE_REPCOPY = 0x04,
 
 	/* Interrupt */
 	SDXI_DSC_OP_SUBTYPE_INTR = 0x00,

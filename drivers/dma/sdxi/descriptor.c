@@ -91,6 +91,56 @@ int sdxi_encode_copy(struct sdxi_desc *desc, const struct sdxi_copy *params)
 }
 EXPORT_SYMBOL_IF_KUNIT(sdxi_encode_copy);
 
+int sdxi_encode_repcopy(struct sdxi_desc *desc,
+			const struct sdxi_repcopy *params)
+{
+	struct range src, dst;
+	u64 total, nsize, num;
+	u32 opcode;
+
+	if (!IS_ALIGNED(params->src | params->dst | params->src_len, SZ_4K))
+		return -EINVAL;
+	if (params->src_len < SZ_4K || params->src_len > SZ_2M)
+		return -EINVAL;
+	if (!params->nr_copies || params->nr_copies > BIT_ULL(20))
+		return -EINVAL;
+
+	total = params->src_len * params->nr_copies;
+	/* Neither range may wrap past the end of the address space. */
+	src.start = params->src;
+	dst.start = params->dst;
+	if (check_add_overflow(params->src, params->src_len - 1, &src.end) ||
+	    check_add_overflow(params->dst, total - 1, &dst.end))
+		return -EINVAL;
+	/* The source must not overlap the destination (SDXI 1.0 5.6). */
+	if (range_overlaps(&src, &dst))
+		return -EINVAL;
+
+	/* Both fields are encoded as value - 1. */
+	nsize = params->src_len / SZ_4K - 1;
+	num = params->nr_copies - 1;
+
+	opcode = (FIELD_PREP(SDXI_DSC_SUBTYPE, SDXI_DSC_OP_SUBTYPE_REPCOPY) |
+		  FIELD_PREP(SDXI_DSC_TYPE, SDXI_DSC_OP_TYPE_DMAB));
+
+	*desc = (typeof(*desc)) {
+		.repcopy = (typeof(desc->repcopy)) {
+			.opcode = cpu_to_le32(opcode),
+			.nsize = cpu_to_le32(FIELD_PREP(SDXI_DSC_REPCOPY_NSIZE, nsize)),
+			.akey0 = cpu_to_le16(params->src_akey),
+			.akey1 = cpu_to_le16(params->dst_akey),
+			.addr0 = cpu_to_le64(FIELD_PREP(SDXI_DSC_REPCOPY_ADDR, params->src >> 12) |
+					     FIELD_PREP(SDXI_DSC_REPCOPY_AZ, params->zero)),
+			.addr1 = cpu_to_le64(FIELD_PREP(SDXI_DSC_REPCOPY_ADDR, params->dst >> 12)),
+			.num = cpu_to_le32(FIELD_PREP(SDXI_DSC_REPCOPY_NUM, num)),
+			.csb_ptr = cpu_to_le64(FIELD_PREP(SDXI_DSC_NP, 1)),
+		},
+	};
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(sdxi_encode_repcopy);
+
 int sdxi_encode_intr(struct sdxi_desc *desc,
 		     const struct sdxi_intr *params)
 {
